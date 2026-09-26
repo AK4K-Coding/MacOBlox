@@ -88,7 +88,7 @@ static int host_pages(struct pages *out) {
 }
 
 /* vm_statistics and vm_statistics64 both start with free, active, inactive
- * and wire counts; the 32-bit one has speculative at word 13, the 64-bit one
+ * and wire counts; the 32-bit one has speculative at word 14, the 64-bit one
  * external/internal page counts at words 34/35. */
 static void fill(int flavor, int *info, natural_t count) {
     natural_t *words = (natural_t *)info;
@@ -122,3 +122,55 @@ static kern_return_t macoblox_host_statistics(host_t host, int flavor, int *info
     return result;
 }
 DYLD_INTERPOSE(macoblox_host_statistics, host_statistics)
+
+/* Roblox's own memory ("Mem" in the performance stats) comes from
+ * task_info(TASK_VM_INFO). Darling fills in the resident size but leaves
+ * internal and phys_footprint (the figure macOS reports as an app's memory)
+ * at zero, so the stats showed 0.00 MB. For the calling task they get the
+ * process's anonymous memory from Linux (RssAnon, plus VmSwap for the
+ * footprint, which on macOS includes compressed memory). */
+extern kern_return_t task_info(unsigned int, int, int *, natural_t *);
+extern unsigned int mach_task_self_;
+
+#define TASK_VM_INFO 22
+#define TASK_VM_INFO_REV1_COUNT 38 /* natural_t words up to phys_footprint */
+
+static int own_memory_kb(unsigned long long *anonymous, unsigned long long *swapped) {
+    static unsigned long long cached_anonymous, cached_swapped, cached_at;
+    unsigned long long now = mach_absolute_time();
+    if (!cached_at || now - cached_at > 250000000ULL) {
+        char text[4096];
+        int fd = open("/Volumes/SystemRoot/proc/self/status", 0 /* O_RDONLY */);
+        if (fd < 0)
+            return 0;
+        ssize_t length = read(fd, text, sizeof text - 1);
+        close(fd);
+        if (length <= 0)
+            return 0;
+        text[length] = 0;
+        cached_anonymous = meminfo_value(text, "RssAnon");
+        cached_swapped = meminfo_value(text, "VmSwap");
+        cached_at = now;
+    }
+    *anonymous = cached_anonymous;
+    *swapped = cached_swapped;
+    return cached_anonymous != 0;
+}
+
+static kern_return_t macoblox_task_info(unsigned int task, int flavor, int *info, natural_t *count) {
+    kern_return_t result = task_info(task, flavor, info, count);
+    if (result != 0 || flavor != TASK_VM_INFO || task != mach_task_self_ || !info || !count ||
+        *count < TASK_VM_INFO_REV1_COUNT)
+        return result;
+    /* task_vm_info (packed to 4 bytes): internal at byte 48, phys_footprint at 144. */
+    unsigned long long *internal = (unsigned long long *)((char *)info + 48);
+    unsigned long long *footprint = (unsigned long long *)((char *)info + 144);
+    unsigned long long anonymous, swapped;
+    if (!*footprint && own_memory_kb(&anonymous, &swapped)) {
+        if (!*internal)
+            *internal = anonymous * 1024;
+        *footprint = (anonymous + swapped) * 1024;
+    }
+    return result;
+}
+DYLD_INTERPOSE(macoblox_task_info, task_info)
