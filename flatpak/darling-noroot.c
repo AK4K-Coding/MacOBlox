@@ -77,6 +77,7 @@ DECLARE_REAL(umount);
 DECLARE_REAL(mount);
 DECLARE_REAL(syscall);
 DECLARE_REAL(setenv);
+DECLARE_REAL(exit);
 
 uid_t getuid(void) {
     if (current_role() == SERVER && server_is_root)
@@ -203,6 +204,7 @@ __attribute__((constructor(101))) static void resolve_real_functions(void) {
     RESOLVE(mount);
     RESOLVE(syscall);
     RESOLVE(setenv);
+    RESOLVE(exit);
 }
 
 /* The prefix, from darlingserver's command line (argv[1]). */
@@ -232,27 +234,55 @@ int setenv(const char *name, const char *value, int overwrite) {
     return real_setenv(name, value, overwrite);
 }
 
+/* Copy `source` to `target` through a temporary file renamed into place:
+ * a launchd left over from an earlier server may still have the old copy
+ * mapped (truncating it in place would crash it), and a short copy must not
+ * replace a good one. */
+static int copy_file(const char *source, const char *target) {
+    char temporary[4200];
+    snprintf(temporary, sizeof temporary, "%s.%ld.tmp", target, (long)getpid());
+    FILE *in = fopen(source, "rb");
+    if (!in)
+        return 0;
+    FILE *out = fopen(temporary, "wb");
+    if (!out) {
+        fclose(in);
+        return 0;
+    }
+    char block[65536];
+    size_t got;
+    int ok = 1;
+    while (ok && (got = fread(block, 1, sizeof block, in)) > 0)
+        ok = fwrite(block, 1, got, out) == got;
+    ok = ok && !ferror(in);
+    fclose(in);
+    ok = fclose(out) == 0 && ok;
+    ok = ok && rename(temporary, target) == 0;
+    if (!ok)
+        unlink(temporary);
+    return ok;
+}
+
 static void install_pid1_library(void) {
     static int installed;
     const char *source = getenv("MACOBLOX_PID1_DYLIB");
     if (installed || !source || !server_prefix()[0])
         return;
     char target[4096];
-    snprintf(target, sizeof target, "%s/usr/lib/macoblox_launchd_pid1.dylib", server_prefix());
-    FILE *in = fopen(source, "rb"), *out = in ? fopen(target, "wb") : 0;
-    char block[65536];
-    size_t got;
-    while (in && out && (got = fread(block, 1, sizeof block, in)) > 0)
-        fwrite(block, 1, got, out);
-    if (in)
-        fclose(in);
-    if (out) {
-        fclose(out);
-        installed = 1;
-        /* Inherited by launchd and everything it starts; only launchd
-         * changes its PID, the others map PID 1 back to it. */
-        setenv("DYLD_INSERT_LIBRARIES", "/usr/lib/macoblox_launchd_pid1.dylib", 1);
+    if (snprintf(target, sizeof target, "%s/usr/lib/macoblox_launchd_pid1.dylib", server_prefix()) >=
+        (int)sizeof target)
+        return;
+    if (!copy_file(source, target)) {
+        /* No usr/lib yet: a new prefix, copied again before launchd starts. */
+        if (errno != ENOENT)
+            fprintf(stderr, "[noroot] could not copy %s to %s: %s\n", source, target, strerror(errno));
+        return;
     }
+    installed = 1;
+    /* Inherited by launchd, the only process this server starts. launchd
+     * removes it from its own environment (launchd_pid1.c), so the
+     * daemons and programs it starts do not load the library. */
+    setenv("DYLD_INSERT_LIBRARIES", "/usr/lib/macoblox_launchd_pid1.dylib", 1);
 }
 
 __attribute__((constructor)) static void setup(void) {
@@ -299,9 +329,9 @@ void exit(int status) {
             fprintf(stderr, "[noroot] exit(%d) from %s+0x%lx\n", status, info.dli_fname,
                     (unsigned long)((char *)caller - (char *)info.dli_fbase));
     }
-    static void (*real_exit)(int);
-    if (!real_exit)
-        real_exit = (void (*)(int))dlsym(RTLD_NEXT, "exit");
-    real_exit(status);
-    __builtin_unreachable();
+    /* Resolved when the library loaded: dlsym here would crash a child of
+     * Darling's raw fork (see above). */
+    if (real_exit)
+        real_exit(status);
+    _exit(status);
 }

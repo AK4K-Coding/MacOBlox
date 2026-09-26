@@ -13,6 +13,12 @@ fi
 # Darling's Mesa receives X11 displays. A desktop session may export
 # EGL_PLATFORM=wayland, which makes Mesa treat them as Wayland and crash.
 export EGL_PLATFORM=x11
+# No host player here (the launcher's pw-cat FIFO), and Darling's own audio
+# path crashes the game: no sound, as the launcher does without pw-cat.
+# MACOBLOX_AUDIO_FIFO=... or MACOBLOX_AUDIO=1 overrides this.
+if [[ -z ${MACOBLOX_AUDIO_FIFO:-} ]]; then
+  export MACOBLOX_AUDIO=${MACOBLOX_AUDIO:-0}
+fi
 "$project_dir/build_debug_shim.sh"
 mkdir -p "$project_dir/logs"
 log_file=$(mktemp "$project_dir/logs/launch-$(date +%Y%m%d-%H%M%S)-XXXXXX.log")

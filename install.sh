@@ -5,12 +5,20 @@
 #   curl -fsSL https://raw.githubusercontent.com/narezy/MacOBlox/main/install.sh | bash
 #
 # Everything runs inside main(), called on the last line, so a download cut
-# off halfway does nothing.
+# off halfway does nothing. The exit on that same line matters: main points
+# stdin at the terminal (curl | bash), and bash would then read and run
+# whatever is typed there as the rest of the script.
 
 set -euo pipefail
 
 REPO=https://github.com/narezy/MacOBlox.git
 DIR=${XDG_DATA_HOME:-$HOME/.local/share}/MacOBlox
+# Darling's Debian packages, pinned to the release the Flatpak uses
+# (flatpak/xyz.narez.MacOBlox.yml; change both together). The checksum makes
+# sure the download is that release, and a new Darling release cannot break
+# installs before the shim was tested with it.
+DARLING_TAG=v0.1.20260608
+DARLING_DEBS_SHA256=27469ef3932da2e91dd7fb34b70e3628a3e54b7af9fb5480051f44af35eca1fd
 
 say() { printf '\033[1;35m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -50,15 +58,17 @@ install_debian() {
   sudo apt-get install -y git curl unzip clang lld pipewire-bin python3 python3-gi \
     gir1.2-gtk-4.0 gir1.2-adw-1
   command -v darling >/dev/null && return
-  # The release page redirects to the newest tag, v0.1.YYYYMMDD; its Debian
-  # packages (built for Ubuntu 24.04) come as debs_YYYYMMDD.zip.
-  local tag build
-  tag=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/darlinghq/darling/releases/latest)
-  tag=${tag##*/}
-  say "Installing Darling $tag"
+  # Release v0.1.YYYYMMDD has its Debian packages (built for Ubuntu 24.04)
+  # as debs_YYYYMMDD.zip.
+  local build
+  say "Installing Darling $DARLING_TAG"
   build=$(mktemp -d)
   curl -fL --progress-bar -o "$build/debs.zip" \
-    "https://github.com/darlinghq/darling/releases/download/$tag/debs_${tag##*.}.zip"
+    "https://github.com/darlinghq/darling/releases/download/$DARLING_TAG/debs_${DARLING_TAG##*.}.zip"
+  if ! printf '%s  %s\n' "$DARLING_DEBS_SHA256" "$build/debs.zip" | sha256sum -c --quiet -; then
+    rm -rf "$build"
+    die "The Darling download does not match its checksum. Try again later."
+  fi
   unzip -q "$build/debs.zip" -d "$build"
   sudo apt-get install -y "$build"/debs_*/*.deb
   rm -rf "$build"
@@ -112,4 +122,4 @@ main() {
   say "Done. Open Mac O' Blox from the app menu, press Install Roblox, then Play."
 }
 
-main "$@"
+main "$@"; exit

@@ -15,7 +15,6 @@ finish-args:
   - --device=dri
   # Roblox asks the GPU driver for VRAM through sysfs (host_vram_bytes).
   - --filesystem=/sys/class/drm:ro
-  - --talk-name=org.freedesktop.Notifications
 modules:
   - name: darling
     buildsystem: simple
@@ -49,6 +48,10 @@ modules:
       - install -Dm755 flatpak/macoblox.sh /app/bin/macoblox
       - for size in 16 22 24 32 48 64 128 256 512; do install -Dm644 branding/icons/macoblox-$size.png
         /app/share/icons/hicolor/${size}x${size}/apps/xyz.narez.MacOBlox.png; done
+      # Also as "macoblox", the name the launcher gives its windows (only
+      # app-ID icons are exported to the host; this one stays inside).
+      - for size in 16 22 24 32 48 64 128 256 512; do install -Dm644 branding/icons/macoblox-$size.png
+        /app/share/icons/hicolor/${size}x${size}/apps/macoblox.png; done
       - install -d /app/share/applications
       - sed 's/^Icon=.*/Icon=xyz.narez.MacOBlox/' packaging/xyz.narez.MacOBlox.desktop
         > /app/share/applications/xyz.narez.MacOBlox.desktop
@@ -60,6 +63,7 @@ modules:
       - type: dir
         path: ..
         skip:
+          - .git
           - RobloxPlayer.app
           - build
           - backups
