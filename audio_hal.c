@@ -78,7 +78,7 @@ static int tracing(void) {
     static int value = -1;
     if (value < 0) {
         const char *text = getenv("MACOBLOX_TRACE_AUDIO");
-        value = text && text[0] ? 1 : 0;
+        value = text && text[0] && text[0] != '0';
     }
     return value;
 }
@@ -372,6 +372,9 @@ typedef struct {
     volatile unsigned long ring_written, ring_read;
     volatile int producing;
     void *thread;
+    /* Read at start, not on the render thread (getenv races setenv). */
+    char fifo_path[1024];
+    long buffer_ms;
 } OutputUnit;
 
 #define INVALID_PROPERTY (-10879)
@@ -395,7 +398,7 @@ extern int pthread_create(void **, const void *, void *(*)(void *), void *);
 extern int pthread_join(void *, void **);
 extern int pthread_attr_init(void *);
 extern int pthread_attr_setstacksize(void *, unsigned long);
-extern int usleep(unsigned int);
+extern void macoblox_sleep_us(unsigned int); /* darling_fixes.c: no darlingserver request */
 
 static UInt32 unit_frame_bytes(OutputUnit *unit) {
     UInt32 channels = unit->format.channels_per_frame ? unit->format.channels_per_frame : 2;
@@ -403,8 +406,8 @@ static UInt32 unit_frame_bytes(OutputUnit *unit) {
     return channels * sample_bytes;
 }
 
-/* Render `frames` frames into `out` as interleaved samples. */
-static void unit_render(OutputUnit *unit, unsigned char *out, UInt32 frames) {
+/* Render `frames` frames into `out` as interleaved samples; FMOD's status. */
+static OSStatus unit_render(OutputUnit *unit, unsigned char *out, UInt32 frames) {
     UInt32 channels = unit->format.channels_per_frame ? unit->format.channels_per_frame : 2;
     UInt32 sample_bytes = unit->format.bits_per_channel / 8 ? unit->format.bits_per_channel / 8 : 4;
     UInt32 frame_bytes = channels * sample_bytes;
@@ -433,6 +436,7 @@ static void unit_render(OutputUnit *unit, unsigned char *out, UInt32 frames) {
     if (status != NO_ERROR)
         for (UInt32 i = 0; i < frames * frame_bytes; i++) out[i] = 0;
     unit->sample_time += frames;
+    return status;
 }
 
 static void *unit_render_thread(void *context) {
@@ -445,7 +449,7 @@ static void *unit_render_thread(void *context) {
     while (unit->producing) {
         unsigned long used = unit->ring_written - unit->ring_read;
         if (unit->ring_bytes - used < chunk) {
-            usleep(2000);
+            macoblox_sleep_us(2000);
             continue;
         }
         unit_render(unit, block, RENDER_FRAMES);
@@ -464,61 +468,285 @@ static void *unit_render_thread(void *context) {
  * path runs PulseAudio on GCD, and Darling's workqueue nests every work item
  * on the same thread stack until it overflows; with sound playing that took
  * a few seconds. Writing to a FIFO keeps Darling's CoreAudio, PulseAudio and
- * GCD out of the audio path entirely. The render thread stays about 60 ms
- * ahead of real time, so the pipe never holds much audio. */
+ * GCD out of the audio path entirely.
+ *
+ * The render thread calls FMOD for a block every 512 frames' time, as a
+ * sound card does: FMOD mixes on its own thread, and blocks asked for in
+ * bursts came back silent (heard as dropouts of 11-35 ms; pw-cat takes 40 ms
+ * of sound at once, so filling the pipe back up at once meant 3-4 calls
+ * within 3 ms). That pace is corrected by up to 5% to keep about 50 ms of
+ * sound in the pipe on average (MACOBLOX_AUDIO_BUFFER_MS), measured with
+ * FIONREAD through a direct Linux ioctl: pw-cat drains it at the pace of the
+ * sound card's clock, so the delay stays the same all session. Pacing by mach_absolute_time instead, as
+ * before, never saw pw-cat: every cycle pw-cat skipped stayed in the pipe as
+ * extra delay (on the host, 80 ms of queued sound became 103 ms within 90 s)
+ * and a sound card whose clock runs apart from the system clock (USB and
+ * wireless headsets) slowly filled or drained the pipe. The wall clock stays
+ * as the fallback when FIONREAD fails. The FIFO is written non-blocking: a
+ * player that stopped reading must not block this thread, nor
+ * AudioOutputUnitStop, which joins it. */
 extern int open(const char *, int, ...);
 extern long write(int, const void *, unsigned long);
 extern int close(int);
 extern int *__error(void);
 extern int pthread_sigmask(int, const unsigned int *, unsigned int *);
+extern int atoi(const char *);
+extern int vsnprintf(char *, unsigned long, const char *, __builtin_va_list);
 #define FIFO_AHEAD_FRAMES 2600
+#define FIFO_BUFFER_MS 50
+#define DARWIN_O_WRONLY 0x1
+#define DARWIN_O_NONBLOCK 0x4
+#define DARWIN_EINTR 4
+#define DARWIN_EAGAIN 35
+
+/* The pipe's capacity in frames after asking Linux for room for `wanted`
+ * frames (F_SETPIPE_SZ, up to /proc/sys/fs/pipe-max-size, 1 MB by default,
+ * for users); 0 if Linux does not say. A pipe holds 64 KB (186 ms) unless
+ * enlarged, too little for a large MACOBLOX_AUDIO_BUFFER_MS. */
+static long fifo_capacity_frames(int fd, UInt32 frame_bytes, long wanted) {
+    long size;
+    __asm__ volatile("syscall" : "=a"(size) : "a"(72L /* Linux fcntl */), "D"((long)fd), "S"(1032L /* F_GETPIPE_SZ */)
+                     : "rcx", "r11", "memory");
+    if (size > 0 && size / (long)frame_bytes < wanted) {
+        long grown;
+        __asm__ volatile("syscall" : "=a"(grown)
+                         : "a"(72L), "D"((long)fd), "S"(1031L /* F_SETPIPE_SZ */), "d"(wanted * (long)frame_bytes)
+                         : "rcx", "r11", "memory");
+        if (grown > 0)
+            size = grown;
+    }
+    return size > 0 ? size / (long)frame_bytes : 0;
+}
+
+/* Frames queued in the pipe behind `fd`, or -1 without FIONREAD. */
+static long fifo_queued_frames(int fd, UInt32 frame_bytes) {
+    int bytes = 0;
+    long result;
+    __asm__ volatile("syscall" : "=a"(result)
+                     : "a"(16L /* Linux ioctl */), "D"((long)fd), "S"(0x541BL /* FIONREAD */), "d"(&bytes)
+                     : "rcx", "r11", "memory");
+    return result < 0 ? -1 : bytes / (long)frame_bytes;
+}
+
+/* Write all of `data` unless the player stops reading for 250 ms (the rest
+ * is dropped) or the unit stops. Returns 0 when the FIFO has to be reopened. */
+static int fifo_write(OutputUnit *unit, int fd, const unsigned char *data, unsigned long size) {
+    unsigned long done = 0;
+    int waited_ms = 0;
+    while (done < size && unit->producing) {
+        long written = write(fd, data + done, size - done);
+        if (written > 0) {
+            done += (unsigned long)written;
+            waited_ms = 0;
+        } else if (written < 0 && *__error() == DARWIN_EINTR) {
+            continue;
+        } else if (written < 0 && *__error() == DARWIN_EAGAIN) {
+            if (waited_ms >= 250)
+                return 1;
+            macoblox_sleep_us(2000);
+            waited_ms += 2;
+        } else {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Audio problems in the log (always on, rate-limited): the pipe ran dry
+ * because this thread came late, FMOD took long to render, or the player
+ * stopped reading. Silence with none of these comes from the player's side. */
+__attribute__((format(printf, 1, 2)))
+static void audio_event(const char *format, ...) {
+    static volatile long events;
+    long count = __sync_add_and_fetch(&events, 1);
+    if (count > 40 && count % 100)
+        return;
+    char line[240];
+    int length = snprintf(line, sizeof line, "[MacOBlox Audio] ");
+    __builtin_va_list arguments;
+    __builtin_va_start(arguments, format);
+    int added = vsnprintf(line + length, sizeof line - (unsigned long)length - 1, format, arguments);
+    __builtin_va_end(arguments);
+    if (added < 0)
+        return;
+    length += added;
+    if ((unsigned long)length > sizeof line - 2) /* cut to fit */
+        length = (int)sizeof line - 2;
+    line[length++] = '\n';
+    write(2, line, (unsigned long)length);
+}
+
+/* Loudest of the last `count` samples (float32) of a block, in thousandths
+ * of full scale: a sound cut off mid-wave ends loud, a finished one near 0. */
+static unsigned long long tail_level(const unsigned char *block, unsigned long size, unsigned long count) {
+    const float *samples = (const float *)block;
+    unsigned long total = size / 4;
+    float peak = 0;
+    for (unsigned long i = total > count ? total - count : 0; i < total; i++) {
+        float value = samples[i] < 0 ? -samples[i] : samples[i];
+        if (value > peak)
+            peak = value;
+    }
+    return (unsigned long long)(peak * 1000 + 0.5f);
+}
+
+static int block_is_silent(const unsigned char *block, unsigned long size) {
+    const unsigned int *words = (const unsigned int *)block;
+    for (unsigned long i = 0; i < size / 4; i++)
+        if (words[i] & 0x7fffffffu) /* anything but +0.0 or -0.0 */
+            return 0;
+    return 1;
+}
+
+/* The render thread runs FMOD's mixer and has to deliver 512 frames every
+ * 11.6 ms while the game keeps every core busy, so it asks for a better nice
+ * value than the game's threads, as far as RLIMIT_NICE allows (direct Linux
+ * setpriority on this thread). */
+static void raise_render_priority(void) {
+    long tid, current;
+    __asm__ volatile("syscall" : "=a"(tid) : "a"(186L /* Linux gettid */) : "rcx", "r11", "memory");
+    /* Linux getpriority returns 20 - nice. A thread already better off (a
+     * tool such as gamemode reniced the game) keeps its value. */
+    __asm__ volatile("syscall" : "=a"(current) : "a"(140L /* Linux getpriority */), "D"(0L), "S"(tid)
+                     : "rcx", "r11", "memory");
+    int nice_now = current > 0 ? 20 - (int)current : 0;
+    static const int nice_values[] = {-11, -8, -5};
+    for (unsigned i = 0; i < sizeof nice_values / sizeof nice_values[0] && nice_values[i] < nice_now; i++) {
+        long result;
+        __asm__ volatile("syscall" : "=a"(result)
+                         : "a"(141L /* Linux setpriority */), "D"(0L /* PRIO_PROCESS */), "S"(tid),
+                           "d"((long)nice_values[i])
+                         : "rcx", "r11", "memory");
+        if (result == 0)
+            return;
+    }
+}
 
 static void *unit_fifo_thread(void *context) {
     OutputUnit *unit = context;
-    const char *path = getenv("MACOBLOX_AUDIO_FIFO");
+    const char *path = unit->fifo_path;
+    raise_render_priority();
     /* A reader that went away must give EPIPE here, not kill the game. */
     unsigned int block_pipe = 1u << (13 - 1); /* SIGPIPE */
     pthread_sigmask(1 /* SIG_BLOCK */, &block_pipe, 0);
     UInt32 frame_bytes = unit_frame_bytes(unit);
     unsigned long chunk = (unsigned long)RENDER_FRAMES * frame_bytes;
     unsigned char *block = malloc(chunk);
-    int fd = -1;
+    int fd = -1, by_fill = 0, player_stuck = 0, sounding = 0, silent_blocks = 0;
+    unsigned long long full_since = 0, last_write = 0, last_render = 0, next_due = 0, cut_level = 0;
     unsigned long long start = mach_absolute_time();
     unsigned long long frames_written = 0;
     Float64 rate = unit->format.sample_rate > 0 ? unit->format.sample_rate : 44100.0;
+    long target_ms = unit->buffer_ms > 0 ? unit->buffer_ms : FIFO_BUFFER_MS;
+    if (target_ms < 15) target_ms = 15;
+    if (target_ms > 500) target_ms = 500;
+    long wanted_target = (long)(rate * target_ms / 1000), target = wanted_target;
+    unsigned long long period = (unsigned long long)(RENDER_FRAMES * 1e9 / rate);
+    double average = (double)target;
     while (block && unit->producing) {
         if (fd < 0) {
-            fd = open(path, 1 /* O_WRONLY */);
+            fd = open(path, DARWIN_O_WRONLY | DARWIN_O_NONBLOCK);
             if (fd < 0) {
-                usleep(200000);
+                macoblox_sleep_us(200000);
                 continue;
             }
+            by_fill = fifo_queued_frames(fd, frame_bytes) >= 0;
+            /* Twice the target must fit (a stopped player is noticed there),
+             * plus a block. */
+            long capacity = fifo_capacity_frames(fd, frame_bytes, 2 * wanted_target + 2 * RENDER_FRAMES);
+            target = wanted_target;
+            if (capacity && 2 * target + RENDER_FRAMES > capacity)
+                target = (capacity - RENDER_FRAMES) / 2;
+            average = (double)target;
             start = mach_absolute_time();
             frames_written = 0;
+            if (tracing()) {
+                char line[120];
+                int length = snprintf(line, sizeof line, "[MacOBlox Audio] FIFO open, pacing by %s, %ld frames\n",
+                                      by_fill ? "pipe fill" : "wall clock", by_fill ? target : FIFO_AHEAD_FRAMES);
+                if (length > 0) write(2, line, (unsigned long)length);
+            }
         }
-        double elapsed = (double)(mach_absolute_time() - start) / 1e9;
-        double ahead = (double)frames_written - elapsed * rate;
-        if (ahead > FIFO_AHEAD_FRAMES) {
-            usleep(3000);
+        if (by_fill) {
+            long queued = fifo_queued_frames(fd, frame_bytes);
+            unsigned long long now = mach_absolute_time();
+            if (queued >= 2 * target) {
+                if (!full_since)
+                    full_since = now;
+                else if (!player_stuck && now - full_since > 1000000000ULL) {
+                    player_stuck = 1;
+                    if (last_write)
+                        audio_event("the player stopped reading %llu ms ago (last block written %llu ms ago)",
+                                    (now - full_since) / 1000000ULL, (now - last_write) / 1000000ULL);
+                    else
+                        audio_event("the player stopped reading %llu ms ago (before the first block)",
+                                    (now - full_since) / 1000000ULL);
+                }
+                macoblox_sleep_us(2000);
+                continue;
+            }
+            if (player_stuck)
+                audio_event("the player reads again after %llu ms (%llu frames were queued)",
+                            (now - full_since) / 1000000ULL, (unsigned long long)queued);
+            full_since = 0;
+            player_stuck = 0;
+            /* Not before the block is due, unless the pipe is nearly empty. */
+            if (next_due && now < next_due && queued >= target / 3) {
+                unsigned long long wait = (next_due - now) / 1000;
+                macoblox_sleep_us(wait < 2000 ? (unsigned int)wait : 2000);
+                continue;
+            }
+            if (queued == 0 && last_write && now - last_write > 30000000ULL)
+                audio_event("pipe ran dry: %llu ms since the last block (that render took %llu ms)",
+                            (now - last_write) / 1000000ULL, last_render / 1000000ULL);
+            /* The next block is due one period later, up to 5% sooner or
+             * later to bring the pipe's average fill back to the target. */
+            average += ((double)queued - average) / 16;
+            double correction = 0.1 * (average - (double)target) / (double)target;
+            correction = correction > 0.05 ? 0.05 : correction < -0.05 ? -0.05 : correction;
+            if (!next_due || now > next_due + period)
+                next_due = now;
+            next_due += (unsigned long long)((double)period * (1 + correction));
+        } else {
+            double elapsed = (double)(mach_absolute_time() - start) / 1e9;
+            double ahead = (double)frames_written - elapsed * rate;
+            if (ahead > FIFO_AHEAD_FRAMES) {
+                macoblox_sleep_us(3000);
+                continue;
+            }
+            if (ahead < -rate / 4) { /* fell far behind (stall): restart the clock */
+                start = mach_absolute_time();
+                frames_written = 0;
+            }
+        }
+        unsigned long long before = mach_absolute_time();
+        OSStatus status = unit_render(unit, block, RENDER_FRAMES);
+        last_render = mach_absolute_time() - before;
+        if (last_render > 20000000ULL)
+            audio_event("FMOD took %llu ms to render %.1f ms of sound", last_render / 1000000ULL,
+                        RENDER_FRAMES * 1000.0 / rate);
+        if (status != NO_ERROR)
+            audio_event("FMOD's render callback failed (status %d), block played as silence", (int)status);
+        /* A dropout inside FMOD: one to three silent blocks (12-35 ms) between
+         * sounding ones. Gaps in the game's own sound are rarely that short. */
+        if (block_is_silent(block, chunk)) {
+            if (sounding && ++silent_blocks > 3)
+                sounding = 0;
+        } else {
+            if (sounding && silent_blocks)
+                audio_event("FMOD rendered %d silent block(s) of %.1f ms between sounding ones; "
+                            "the sound before was cut at level %llu/1000",
+                            silent_blocks, RENDER_FRAMES * 1000.0 / rate, cut_level);
+            sounding = 1;
+            silent_blocks = 0;
+            cut_level = tail_level(block, chunk, 64);
+        }
+        if (!fifo_write(unit, fd, block, chunk)) {
+            close(fd);
+            fd = -1;
             continue;
         }
-        if (ahead < -rate / 4) { /* fell far behind (stall): restart the clock */
-            start = mach_absolute_time();
-            frames_written = 0;
-        }
-        unit_render(unit, block, RENDER_FRAMES);
-        unsigned long done = 0;
-        while (done < chunk) {
-            long written = write(fd, block + done, chunk - done);
-            if (written <= 0) {
-                if (written < 0 && *__error() == 4 /* EINTR */)
-                    continue;
-                close(fd);
-                fd = -1;
-                break;
-            }
-            done += (unsigned long)written;
-        }
+        last_write = mach_absolute_time();
         frames_written += RENDER_FRAMES;
     }
     if (fd >= 0)
@@ -749,7 +977,11 @@ static OSStatus t_start(void *instance) {
     }
     if (unit->running || !unit->output_enabled)
         return NO_ERROR;
-    if (getenv("MACOBLOX_AUDIO_FIFO")) {
+    const char *fifo = getenv("MACOBLOX_AUDIO_FIFO");
+    if (fifo && fifo[0] && __builtin_strlen(fifo) < sizeof unit->fifo_path) {
+        __builtin_memcpy(unit->fifo_path, fifo, __builtin_strlen(fifo) + 1);
+        const char *buffer_ms = getenv("MACOBLOX_AUDIO_BUFFER_MS");
+        unit->buffer_ms = buffer_ms && buffer_ms[0] ? atoi(buffer_ms) : 0;
         if ((unit->format.format_flags & 0x20) && !unit->scratch)
             unit->scratch = malloc((unsigned long)RENDER_FRAMES * unit_frame_bytes(unit));
         unit->producing = 1;
@@ -795,10 +1027,13 @@ static OSStatus t_start(void *instance) {
     OSStatus status = AudioObjectSetPropertyData(unit->device, &format_address, 0, 0,
                                                  sizeof device_format, &device_format);
     report("output unit: device format", unit->device, &format_address, status, 0, 1);
-    status = AudioDeviceCreateIOProcID(unit->device, (void *)unit_ioproc, unit, &unit->ioproc);
+    /* A unit started again after a stop keeps its IOProc. */
+    status = unit->ioproc ? NO_ERROR : AudioDeviceCreateIOProcID(unit->device, (void *)unit_ioproc, unit, &unit->ioproc);
     if (status == NO_ERROR)
         status = AudioDeviceStart(unit->device, unit->ioproc);
     unit->running = status == NO_ERROR;
+    if (!unit->running)
+        unit_stop(unit); /* the render thread would call FMOD with nobody playing */
     report("output unit: start", unit->device, 0, status, 0, 1);
     return status;
 }
