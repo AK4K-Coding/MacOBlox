@@ -8,10 +8,18 @@ NSString *const CHHapticEventParameterIDHapticIntensity = @"HapticIntensity";
 NSString *const CHHapticEventTypeHapticContinuous = @"HapticContinuous";
 
 @interface CHHapticDynamicParameter : NSObject @end
-@implementation CHHapticDynamicParameter @end
+@implementation CHHapticDynamicParameter
+STUB_RESOLVERS
+@end
 @interface CHHapticEvent : NSObject @end
-@implementation CHHapticEvent @end
+@implementation CHHapticEvent
+STUB_RESOLVERS
+@end
 @interface CHHapticEventParameter : NSObject @end
-@implementation CHHapticEventParameter @end
+@implementation CHHapticEventParameter
+STUB_RESOLVERS
+@end
 @interface CHHapticPattern : NSObject @end
-@implementation CHHapticPattern @end
+@implementation CHHapticPattern
+STUB_RESOLVERS
+@end

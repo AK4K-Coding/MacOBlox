@@ -8,8 +8,11 @@
  * macoblox_dns_resolve() answers A lookups by asking the forwarder over UDP
  * and builds the addrinfo list itself; anything it cannot handle (IP
  * literals, IPv6-only requests, named services, no answer) falls back to
- * Darling's resolver. freeaddrinfo() is wrapped so lists built here are freed
- * here. */
+ * Darling's resolver. The list is allocated the way Darling's own is (the
+ * sockaddr and canonical name in blocks of their own), so Darling's
+ * freeaddrinfo() frees it. The forwarder answers SERVFAIL when its server
+ * cannot be reached; when it does not answer at all, it is skipped for 30 s
+ * instead of costing every lookup the 5 s wait. */
 
 typedef unsigned int socklen_t;
 typedef long ssize_t;
@@ -36,20 +39,24 @@ extern int connect(int, const void *, socklen_t);
 extern ssize_t send(int, const void *, size_t, int);
 extern ssize_t recv(int, void *, size_t, int);
 extern int close(int);
+extern int fcntl(int, int, ...);
 extern int poll(struct darwin_pollfd *, unsigned int, int);
 extern void *calloc(size_t, size_t);
 extern void free(void *);
+extern char *strdup(const char *);
 extern unsigned long long mach_absolute_time(void);
-extern void freeaddrinfo(void *);
-
-#define DYLD_INTERPOSE(_replacement, _replacee) \
-    __attribute__((used)) static struct { const void *replacement; const void *replacee; } \
-    _interpose_##_replacee __attribute__((section("__DATA,__interpose"))) = \
-        {(const void *)(unsigned long)&_replacement, (const void *)(unsigned long)&_replacee};
 
 #define AF_INET_DARWIN 2
 #define EAI_NONAME_DARWIN 8
 #define MAX_ADDRESSES 16
+#define AI_CANONNAME_DARWIN 0x2
+#define F_SETFD_DARWIN 2
+#define FD_CLOEXEC_DARWIN 1
+#define FORWARDER_WAIT_MS 2500
+#define FORWARDER_SKIP_NS 30000000000ULL
+
+/* After a forwarder that did not answer at all: skip it until then. */
+static volatile unsigned long long forwarder_skipped_until;
 
 static int forwarder_port(unsigned int *address, unsigned short *port) {
     const char *value = getenv("MACOBLOX_DNS");
@@ -133,6 +140,9 @@ static int query_forwarder(const char *node, unsigned int *addresses) {
     unsigned short server_port;
     if (!forwarder_port(&server, &server_port))
         return -1;
+    unsigned long long now = mach_absolute_time();
+    if (forwarder_skipped_until && now < forwarder_skipped_until)
+        return -1;
     unsigned char query[300];
     unsigned short id = (unsigned short)(mach_absolute_time() >> 3);
     int length = 0;
@@ -160,15 +170,18 @@ static int query_forwarder(const char *node, unsigned int *addresses) {
     int fd = socket(AF_INET_DARWIN, 2 /* SOCK_DGRAM */, 0);
     if (fd < 0)
         return -1;
+    fcntl(fd, F_SETFD_DARWIN, FD_CLOEXEC_DARWIN); /* not into programs the game starts */
     struct darwin_sockaddr_in address = {sizeof address, AF_INET_DARWIN, server_port, server, {0}};
-    int found = -1;
+    int found = -1, silent = 0;
     if (connect(fd, &address, sizeof address) == 0) {
         for (int attempt = 0; attempt < 2 && found == -1; attempt++) {
             if (send(fd, query, (size_t)length, 0) != length)
                 break;
             struct darwin_pollfd wait = {fd, 1, 0};
-            if (poll(&wait, 1, 2500) <= 0)
+            if (poll(&wait, 1, FORWARDER_WAIT_MS) <= 0) {
+                silent++;
                 continue;
+            }
             unsigned char reply[1500];
             ssize_t got = recv(fd, reply, sizeof reply, 0);
             if (got < 12 || reply[0] != query[0] || reply[1] != query[1])
@@ -205,23 +218,9 @@ static int query_forwarder(const char *node, unsigned int *addresses) {
         }
     }
     close(fd);
+    if (silent == 2) /* no reply to either attempt: the forwarder is gone or stuck */
+        forwarder_skipped_until = mach_absolute_time() + FORWARDER_SKIP_NS;
     return found;
-}
-
-/* Lists built here, so freeaddrinfo can tell them apart. */
-static void *volatile owned_lists[256];
-
-static void remember(void *list) {
-    for (int i = 0; i < 256; i++)
-        if (__sync_bool_compare_and_swap(&owned_lists[i], (void *)0, list))
-            return;
-}
-
-static int forget(void *list) {
-    for (int i = 0; i < 256; i++)
-        if (owned_lists[i] == list && __sync_bool_compare_and_swap(&owned_lists[i], list, (void *)0))
-            return 1;
-    return 0;
 }
 
 /* 0 on success with *result set, an EAI error, or -1 to use the system resolver. */
@@ -257,13 +256,17 @@ int macoblox_dns_resolve(const char *node, const char *service, const void *hint
         protocols[0] = hints->protocol ? hints->protocol : (hints->socktype == 2 ? 17 : 6);
         kinds = 1;
     }
+    /* Separate blocks, as Darling's freeaddrinfo frees ai_addr and
+     * ai_canonname on their own before the entry. */
     struct darwin_addrinfo *head = 0, *tail = 0;
     for (int i = 0; i < count; i++) {
         for (int kind = 0; kind < kinds; kind++) {
-            struct darwin_addrinfo *entry = calloc(1, sizeof *entry + sizeof(struct darwin_sockaddr_in));
-            if (!entry)
+            struct darwin_addrinfo *entry = calloc(1, sizeof *entry);
+            struct darwin_sockaddr_in *address = entry ? calloc(1, sizeof *address) : 0;
+            if (!address) {
+                free(entry);
                 break;
-            struct darwin_sockaddr_in *address = (struct darwin_sockaddr_in *)(entry + 1);
+            }
             address->len = sizeof *address;
             address->family = AF_INET_DARWIN;
             address->port = port;
@@ -279,21 +282,8 @@ int macoblox_dns_resolve(const char *node, const char *service, const void *hint
     }
     if (!head)
         return -1;
-    remember(head);
+    if (hints && (hints->flags & AI_CANONNAME_DARWIN))
+        head->canonname = strdup(node); /* no CNAME is followed here */
     *result = head;
     return 0;
 }
-
-static void macoblox_freeaddrinfo(void *list) {
-    if (list && forget(list)) {
-        struct darwin_addrinfo *entry = list;
-        while (entry) {
-            struct darwin_addrinfo *next = entry->next;
-            free(entry); /* sockaddr lives in the same allocation */
-            entry = next;
-        }
-        return;
-    }
-    freeaddrinfo(list);
-}
-DYLD_INTERPOSE(macoblox_freeaddrinfo, freeaddrinfo)

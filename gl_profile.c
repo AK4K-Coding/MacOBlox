@@ -42,7 +42,7 @@ static int core_enabled(void) {
  * these are the NSOpenGLPixelFormat attributes that take a value. */
 static int takes_value(unsigned int attribute) {
     switch (attribute) {
-    case 7: case 8: case 11: case 12: case 13: case 14: case 51: case 52: case 55: case 56:
+    case 7: case 8: case 11: case 12: case 13: case 14: case 55: case 56:
     case 70: case 84: case 99: case 128:
         return 1;
     }
@@ -213,11 +213,15 @@ static unsigned int macoblox_eglChooseConfig(void *display, const int *attribute
 }
 DYLD_INTERPOSE(macoblox_eglChooseConfig, eglChooseConfig)
 
+static void forget_configured_surface(void *surface);
+
 static void *macoblox_eglCreateWindowSurface(void *display, void *config, unsigned long window,
                                              const int *attributes) {
     void *surface = eglCreateWindowSurface(display, config, window, attributes);
-    if (surface)
+    if (surface) {
+        forget_configured_surface(surface); /* a new surface at an old address */
         return surface;
+    }
     int error = eglGetError();
     unsigned int root_visual = 0, window_visual = 0;
     macoblox_raw_x_visuals((unsigned int)window, &root_visual, &window_visual);
@@ -231,6 +235,8 @@ static void *macoblox_eglCreateWindowSurface(void *display, void *config, unsign
              error, window_visual, config_visual(display, config), root_visual,
              surface ? "with the window's visual worked" : "failed");
     log_line(line);
+    if (surface)
+        forget_configured_surface(surface);
     return surface;
 }
 DYLD_INTERPOSE(macoblox_eglCreateWindowSurface, eglCreateWindowSurface)
@@ -270,7 +276,7 @@ unsigned long macoblox_replace_gl_subwindow(void *display, unsigned long parent,
         return old;
 
     /* XWindowAttributes, LP64: x, y, width, height, border_width, depth
-     * as ints, then Visual* at 24; map_state at 84. */
+     * as ints, then Visual* at 24; map_state at 92. */
     unsigned char parent_attributes[256], old_attributes[256];
     if (!get_attributes(display, parent, parent_attributes) || !get_attributes(display, old, old_attributes))
         return old;
@@ -304,36 +310,72 @@ unsigned long macoblox_replace_gl_subwindow(void *display, unsigned long parent,
  * that misses a refresh then waits for the next one, so a game that needs
  * a little more than 16.7 ms drops straight from 60 to 30 FPS; Roblox's own
  * stats showed frames of 30 ms with 9 ms of work and 20 ms idle. The swap
- * interval is set to 0 before the first frame of each context; Roblox caps
- * the frame rate itself (DFIntTaskSchedulerTargetFps) and the compositor
- * keeps the picture tear-free. MACOBLOX_VSYNC=1 keeps vsync.
- * MACOBLOX_FPS_LOG=1 prints the presented frame rate every 5 s. */
+ * interval is set to 0 before the first frame of each window surface (it
+ * belongs to the surface, not the context: a context that gets a new surface
+ * would get vsync back); Roblox caps the frame rate itself
+ * (DFIntTaskSchedulerTargetFps) and the compositor keeps the picture
+ * tear-free. MACOBLOX_VSYNC=1 keeps vsync. MACOBLOX_FPS_LOG=1 prints the
+ * presented frame rate every 5 s. */
 extern unsigned int eglSwapInterval(void *, int);
 extern void *eglGetCurrentDisplay(void);
+extern void *eglGetCurrentSurface(int);
 extern unsigned long long mach_absolute_time(void);
 
+#define EGL_DRAW 0x3059
+#define CONFIGURED_SURFACES 16
+/* Surfaces whose swap interval is 0 already; a full table overwrites its
+ * oldest entry, which then only costs one more eglSwapInterval. */
+static void *configured_surfaces[CONFIGURED_SURFACES];
+static int configured_next;
+static volatile int configured_lock;
+
+static void lock_configured(void) {
+    while (__sync_lock_test_and_set(&configured_lock, 1)) {}
+}
+
+static void forget_configured_surface(void *surface) {
+    lock_configured();
+    for (int i = 0; i < CONFIGURED_SURFACES; i++)
+        if (configured_surfaces[i] == surface)
+            configured_surfaces[i] = 0;
+    __sync_lock_release(&configured_lock);
+}
+
+static void swap_interval_zero(void) {
+    static volatile long logged;
+    void *surface = eglGetCurrentSurface(EGL_DRAW);
+    if (!surface)
+        return;
+    int known = 0;
+    lock_configured();
+    for (int i = 0; i < CONFIGURED_SURFACES && !known; i++)
+        known = configured_surfaces[i] == surface;
+    __sync_lock_release(&configured_lock);
+    if (known)
+        return;
+    void *display = eglGetCurrentDisplay();
+    if (!display || !eglSwapInterval(display, 0))
+        return; /* tried again next frame */
+    lock_configured();
+    configured_surfaces[configured_next] = surface;
+    configured_next = (configured_next + 1) % CONFIGURED_SURFACES;
+    __sync_lock_release(&configured_lock);
+    long count = __sync_add_and_fetch(&logged, 1);
+    if (count <= 8 || count % 100 == 0)
+        write(2, "[MacOBlox GL] vsync off (swap interval 0)\n", 42);
+}
+
 void macoblox_frame_presenting(void *cgl_context) {
-    static void *configured[8];
     static int vsync = -1, fps_log = -1;
+    (void)cgl_context; /* the interval goes with the current draw surface */
     if (vsync < 0) {
         const char *value = getenv("MACOBLOX_VSYNC");
         vsync = value && value[0] == '1';
         value = getenv("MACOBLOX_FPS_LOG");
         fps_log = value && value[0] == '1';
     }
-    if (!vsync) {
-        int known = 0;
-        for (int i = 0; i < 8; i++)
-            if (configured[i] == cgl_context) known = 1;
-        if (!known) {
-            void *display = eglGetCurrentDisplay();
-            if (display && eglSwapInterval(display, 0)) {
-                for (int i = 0; i < 8; i++)
-                    if (!configured[i]) { configured[i] = cgl_context; break; }
-                write(2, "[MacOBlox GL] vsync off (swap interval 0)\n", 42);
-            }
-        }
-    }
+    if (!vsync)
+        swap_interval_zero();
     if (fps_log) {
         static unsigned long long window_start;
         static long frames;
