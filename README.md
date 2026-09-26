@@ -46,8 +46,9 @@ paru -S darling-bin
 sudo pacman -S clang lld unzip pipewire-audio python-gobject gtk4 libadwaita
 ```
 
-Debian, Ubuntu, Mint: download `debs_*.zip` from the
-[Darling releases](https://github.com/darlinghq/darling/releases), then:
+Debian, Ubuntu, Mint: download `debs_20260608.zip` from the
+[Darling release v0.1.20260608](https://github.com/darlinghq/darling/releases/tag/v0.1.20260608)
+(the one Mac O’ Blox is tested with), then:
 
 ```bash
 unzip debs_*.zip -d darling-debs
@@ -94,9 +95,10 @@ error is also saved in `~/.cache/macoblox/last-error.txt`.
 <details>
 <summary>How do I sign in?</summary>
 
-Create the account on [roblox.com](https://www.roblox.com) first: sign up inside
-the game shows a captcha that does not work here. Then sign in in Mac O’ Blox
-however you like, with a password or with Quick Login.
+Create the account on [roblox.com](https://www.roblox.com) first: signing up,
+and signing in with a password, show a captcha that does not work here yet.
+Then sign in in Mac O’ Blox with **Quick Login**: Roblox shows a code, enter it
+on a phone or in a browser where you are already signed in.
 </details>
 
 <details>
