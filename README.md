@@ -29,7 +29,15 @@ curl -fsSL https://raw.githubusercontent.com/narezy/MacOBlox/main/install.sh | b
 
 It installs Darling and everything else, then puts **Mac O’ Blox** in the app
 menu. Open it, press **Install Roblox**, then **Play**. Run the same command
-again to update.
+again for a small menu to update or uninstall. Without a terminal, or for
+scripts, the choices are options too:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/narezy/MacOBlox/main/install.sh | bash -s -- --uninstall
+```
+
+Uninstalling keeps Darling and its prefix, `~/.darling`, which holds your Roblox
+sign-in; `--purge` (or **Uninstall everything** in the menu) deletes that too.
 
 Works on Arch and its relatives (CachyOS, EndeavourOS, Manjaro), Ubuntu 24.04+,
 Debian 13, Linux Mint 22 and Fedora with Darling built from source.
