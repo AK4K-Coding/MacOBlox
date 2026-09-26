@@ -33,6 +33,29 @@ static void write_str(const char* s);
 static void print_hex(unsigned long long val);
 static void print_num(long long val);
 
+// A MACOBLOX_* switch: on when set to anything but "" or "0".
+static int macoblox_env_on(const char* name) {
+    const char* value = getenv(name);
+    return value && value[0] && !(value[0] == '0' && !value[1]);
+}
+
+// The same, read once: `*cache` starts at -1.
+static int macoblox_env_cached(const char* name, volatile int* cache) {
+    int value = *cache;
+    if (value < 0)
+        *cache = value = macoblox_env_on(name);
+    return value;
+}
+
+// dlsym(RTLD_NEXT, name), looked up once per call site: Darling's dlsym
+// walks every loaded image, far too slow for per-frame or per-throw paths.
+#define MACOBLOX_NEXT(type, name) ({ \
+    static void* volatile macoblox_next_cache; \
+    void* macoblox_next_symbol = macoblox_next_cache; \
+    if (!macoblox_next_symbol) \
+        macoblox_next_cache = macoblox_next_symbol = dlsym(RTLD_NEXT, name); \
+    (type)macoblox_next_symbol; })
+
 // Darling can create an IONotificationPort but currently returns an error when
 // Roblox registers HID matching notifications.  Roblox then destroys the port
 // and attempts a second registration with the cleared pointer, which crashes
@@ -50,9 +73,12 @@ static int macoblox_IOServiceAddMatchingNotification(
     unsigned int* iterator) {
     (void)notification_port;
     (void)notification_type;
-    (void)matching;
     (void)callback;
     (void)context;
+    // Like the real function, consume the caller's reference to `matching`.
+    extern void CFRelease(const void*);
+    if (matching)
+        CFRelease(matching);
     if (iterator)
         *iterator = 0;
     write_str("[MacOBlox] IOKit HID notification registered with empty iterator\n");
@@ -61,9 +87,11 @@ static int macoblox_IOServiceAddMatchingNotification(
 DYLD_INTERPOSE(macoblox_IOServiceAddMatchingNotification,
                IOServiceAddMatchingNotification);
 
-// Keep the source for each OpenGL shader long enough to capture the first
-// source rejected by Mesa. Roblox's normal log contains the compiler message
-// and line number, but not the GLSL text that caused it.
+// Rewrite GLSL that Mesa rejects (macoblox_fix_mesa_shader_indices) and
+// capture the first source Mesa rejects: Roblox's normal log contains the
+// compiler message and line number, but not the GLSL text that caused it.
+// The fix applies to every shader; sources are kept (for the final-program
+// dump) only with MACOBLOX_TRACE_GL=1, and only for the first 8192 names.
 extern void glShaderSource(unsigned int, int, const char* const*, const int*);
 extern void glCompileShader(unsigned int);
 extern unsigned int glCreateShader(unsigned int);
@@ -82,6 +110,12 @@ static unsigned int macoblox_shader_types[MACOBLOX_SHADER_SLOTS];
 static unsigned int macoblox_program_shaders[MACOBLOX_SHADER_SLOTS][4];
 static volatile int macoblox_dumped_failed_shader;
 static volatile int macoblox_dumped_final_program;
+
+static int macoblox_gl_trace_enabled(void);
+static int macoblox_gl_test_ui_color(void) {
+    static volatile int enabled = -1;
+    return macoblox_env_cached("MACOBLOX_GL_TEST_UI_COLOR", &enabled);
+}
 
 static unsigned int macoblox_glCreateShader(unsigned int type) {
     static unsigned int (*real_function)(unsigned int);
@@ -174,8 +208,7 @@ static char* macoblox_fix_mesa_shader_indices(char* source,
 
 static void macoblox_apply_ui_color_test(char* source,
                                          unsigned long source_length) {
-    const char* enabled = getenv("MACOBLOX_GL_TEST_UI_COLOR");
-    if (!enabled || !enabled[0])
+    if (!macoblox_gl_test_ui_color())
         return;
     static const char needle[] =
         "_entryPointOutput = VARYING1 * _676;";
@@ -216,12 +249,12 @@ static void macoblox_glShaderSource(unsigned int shader, int count,
                                     const char* const* strings,
                                     const int* lengths) {
     void (*real_function)(unsigned int, int, const char* const*, const int*) =
-        (void (*)(unsigned int, int, const char* const*, const int*))
-            dlsym(RTLD_NEXT, "glShaderSource");
+        MACOBLOX_NEXT(void (*)(unsigned int, int, const char* const*, const int*), "glShaderSource");
 
     const char* fixed_string = 0;
     int fixed_length = 0;
-    if (shader < MACOBLOX_SHADER_SLOTS && count > 0 && strings) {
+    char* owned = 0;
+    if (count > 0 && strings) {
         unsigned long total = 0;
         for (int index = 0; index < count; index++) {
             unsigned long part = (lengths && lengths[index] >= 0)
@@ -247,8 +280,7 @@ static void macoblox_glShaderSource(unsigned int shader, int count,
                 copy[position] = 0;
                 copy = macoblox_fix_mesa_shader_indices(copy, &total);
                 macoblox_apply_ui_color_test(copy, total);
-                const char* ui_test = getenv("MACOBLOX_GL_TEST_UI_COLOR");
-                if (ui_test && ui_test[0] &&
+                if (macoblox_gl_test_ui_color() && shader < MACOBLOX_SHADER_SLOTS &&
                     macoblox_shader_types[shader] == 0x8B31U &&
                     macoblox_source_contains(copy, total,
                                              "out vec2 VARYING2;")) {
@@ -269,12 +301,16 @@ static void macoblox_glShaderSource(unsigned int shader, int count,
                         write_str("[MacOBlox GL] Forced UI vertex coverage\n");
                     }
                 }
-                if (macoblox_shader_sources[shader])
-                    free(macoblox_shader_sources[shader]);
-                macoblox_shader_sources[shader] = copy;
-                macoblox_shader_source_lengths[shader] = total;
                 fixed_string = copy;
                 fixed_length = (int)total;
+                if (macoblox_gl_trace_enabled() && shader < MACOBLOX_SHADER_SLOTS) {
+                    if (macoblox_shader_sources[shader])
+                        free(macoblox_shader_sources[shader]);
+                    macoblox_shader_sources[shader] = copy;
+                    macoblox_shader_source_lengths[shader] = total;
+                } else {
+                    owned = copy; // GL keeps its own copy of the source
+                }
             }
         }
     }
@@ -284,33 +320,44 @@ static void macoblox_glShaderSource(unsigned int shader, int count,
         else
             real_function(shader, count, strings, lengths);
     }
+    free(owned);
 }
 DYLD_INTERPOSE(macoblox_glShaderSource, glShaderSource);
 
 static void macoblox_glCompileShader(unsigned int shader) {
     void (*real_compile)(unsigned int) =
-        (void (*)(unsigned int))dlsym(RTLD_NEXT, "glCompileShader");
+        MACOBLOX_NEXT(void (*)(unsigned int), "glCompileShader");
     void (*real_get_shader_iv)(unsigned int, unsigned int, int*) =
-        (void (*)(unsigned int, unsigned int, int*))
-            dlsym(RTLD_NEXT, "glGetShaderiv");
+        MACOBLOX_NEXT(void (*)(unsigned int, unsigned int, int*), "glGetShaderiv");
     if (real_compile)
         real_compile(shader);
 
     int succeeded = 1;
     if (real_get_shader_iv)
         real_get_shader_iv(shader, 0x8B81U, &succeeded); // GL_COMPILE_STATUS
-    if (!succeeded && shader < MACOBLOX_SHADER_SLOTS &&
-        macoblox_shader_sources[shader] &&
+    if (succeeded || macoblox_dumped_failed_shader)
+        return;
+    // The source as GL has it (after the fixes above).
+    void (*real_get_source)(unsigned int, int, int*, char*) =
+        MACOBLOX_NEXT(void (*)(unsigned int, int, int*, char*), "glGetShaderSource");
+    int size = 0;
+    if (real_get_shader_iv)
+        real_get_shader_iv(shader, 0x8B88U, &size); // GL_SHADER_SOURCE_LENGTH
+    char* source = size > 0 && real_get_source ? (char*)malloc((unsigned long)size) : 0;
+    int length = 0;
+    if (source)
+        real_get_source(shader, size, &length, source);
+    if (source && length > 0 &&
         __sync_bool_compare_and_swap(&macoblox_dumped_failed_shader, 0, 1)) {
         MacOBloxFILE* output = fopen(
             "/private/tmp/macoblox-first-failed-shader.glsl", "w");
         if (output) {
-            fwrite(macoblox_shader_sources[shader], 1,
-                   macoblox_shader_source_lengths[shader], output);
+            fwrite(source, 1, (unsigned long)length, output);
             fclose(output);
             write_str("[MacOBlox GL] Captured first failed shader source\n");
         }
     }
+    free(source);
 }
 DYLD_INTERPOSE(macoblox_glCompileShader, glCompileShader);
 
@@ -327,12 +374,8 @@ extern int CGLFlushDrawable(void*);
 extern unsigned int eglMakeCurrent(void*, void*, void*, void*);
 
 static int macoblox_trace_cgl_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char* value = getenv("MACOBLOX_TRACE_CGL");
-        enabled = value && value[0] ? 1 : 0;
-    }
-    return enabled;
+    static volatile int enabled = -1;
+    return macoblox_env_cached("MACOBLOX_TRACE_CGL", &enabled);
 }
 
 static int macoblox_trace_cgl_should_log(volatile long* counter) {
@@ -567,12 +610,8 @@ static void macoblox_dump_actual_program_sources(unsigned int program) {
 // after CALayerContext renders fixed properly. They stay available for
 // debugging with MACOBLOX_GL_HACKS=1.
 static int macoblox_gl_hacks_disabled(void) {
-    static int disabled = -1;
-    if (disabled < 0) {
-        const char* value = getenv("MACOBLOX_GL_HACKS");
-        disabled = value && value[0] ? 0 : 1;
-    }
-    return disabled;
+    static volatile int enabled = -1;
+    return !macoblox_env_cached("MACOBLOX_GL_HACKS", &enabled);
 }
 
 static void macoblox_ensure_gl_window_surface(void) {
@@ -640,8 +679,7 @@ static int macoblox_should_skip_foreign_window_command(int learn_renderer) {
             get_integer(0x8B8DU, &program); // GL_CURRENT_PROGRAM
         if (program > 0) {
             macoblox_gl_render_egl_context = context;
-            const char* ui_test = getenv("MACOBLOX_GL_TEST_UI_COLOR");
-            if (ui_test && ui_test[0] && program >= 700) {
+            if (macoblox_gl_test_ui_color() && program >= 700) {
                 void (*disable)(unsigned int) =
                     (void (*)(unsigned int))dlsym(RTLD_NEXT, "glDisable");
                 void (*color_mask)(unsigned char, unsigned char,
@@ -844,12 +882,8 @@ static void macoblox_trace_window_draw(unsigned int mode, int count) {
 // glGetIntegerv per draw, which in game (thousands of draws per frame) was a
 // large part of the frame time.
 static int macoblox_gl_trace_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char* value = getenv("MACOBLOX_TRACE_GL");
-        enabled = value && value[0] ? 1 : 0;
-    }
-    return enabled;
+    static volatile int enabled = -1;
+    return macoblox_env_cached("MACOBLOX_TRACE_GL", &enabled);
 }
 
 static void macoblox_glBindFramebuffer(unsigned int target,
@@ -1135,8 +1169,17 @@ struct macoblox_addrinfo_head {
     int ai_socktype;
     int ai_protocol;
 };
+//
+// Lookups through Darling's resolver go one at a time, and a lookup that
+// fails for a temporary reason (EAI_AGAIN, EAI_FAIL, EAI_SYSTEM) is tried up
+// to four times, 50 ms apart. Waiting threads nap with direct Linux sleeps
+// (macoblox_sleep_us): Darling's usleep costs two darlingserver requests, so
+// the old 1 ms polling kept darlingserver busy while a lookup was slow. A
+// name that does not exist (EAI_NONAME, e.g. a blocked telemetry host) is
+// not retried, and the lock is not held during the pause between attempts:
+// before, such a name held up every other lookup for 150 ms or more.
 extern int getaddrinfo(const char*, const char*, const void*, void**);
-extern int usleep(unsigned int);
+extern void macoblox_sleep_us(unsigned int);
 static volatile int macoblox_dns_lock;
 extern int macoblox_dns_resolve(const char* node, const char* service,
                                 const void* hints, void** result);
@@ -1147,26 +1190,26 @@ static int macoblox_getaddrinfo(const char* node, const char* service,
     if (own >= 0)
         return own;
     int (*real_getaddrinfo)(const char*, const char*, const void*, void**) =
-        (int (*)(const char*, const char*, const void*, void**))dlsym(RTLD_NEXT, "getaddrinfo");
-    while (__sync_lock_test_and_set(&macoblox_dns_lock, 1))
-        usleep(1000);
+        MACOBLOX_NEXT(int (*)(const char*, const char*, const void*, void**), "getaddrinfo");
 
     int status = -1;
     int attempts = 0;
-    if (real_getaddrinfo) {
-        for (attempts = 1; attempts <= 4; attempts++) {
-            if (result)
-                *result = 0;
-            status = real_getaddrinfo(node, service, hints, result);
-            if (status == 0)
-                break;
-            usleep(50000);
-        }
+    while (real_getaddrinfo && attempts < 4) {
+        if (attempts)
+            macoblox_sleep_us(50000);
+        attempts++;
+        while (__sync_lock_test_and_set(&macoblox_dns_lock, 1))
+            macoblox_sleep_us(1000);
+        if (result)
+            *result = 0;
+        status = real_getaddrinfo(node, service, hints, result);
+        __sync_lock_release(&macoblox_dns_lock);
+        if (status != 2 /* EAI_AGAIN */ && status != 4 /* EAI_FAIL */ && status != 11 /* EAI_SYSTEM */)
+            break;
     }
-    __sync_lock_release(&macoblox_dns_lock);
 
-    const char* trace = getenv("MACOBLOX_TRACE_DNS");
-    if (status != 0 || (trace && *trace == '1')) {
+    static volatile int trace = -1;
+    if (status != 0 || macoblox_env_cached("MACOBLOX_TRACE_DNS", &trace)) {
         write_str("[MacOBlox DNS] node=");
         write_str(node ? node : "(null)");
         write_str(" service=");
@@ -1199,121 +1242,18 @@ extern void _ZSt9terminatev(void);
 extern void objc_exception_throw(id);
 extern int NSApplicationMain(int argc, const char *argv[]);
 
-static int in_interpose_exit = 0;
-void my_exit(int status) {
-    if (!in_interpose_exit) {
-        in_interpose_exit = 1;
-        write_str("\n[MacOBlox Hook] exit(");
-        print_num(status);
-        write_str(") called!\n[MacOBlox Hook] Backtrace:\n");
-        print_backtrace();
-    }
-    void (*real_exit)(int) = (void (*)(int))dlsym(RTLD_NEXT, "exit");
-    if (real_exit) real_exit(status);
-    _exit(status);
-}
-// Disabled: tracing/suppressing exit changes crash and post-fork semantics.
-
-void my__exit(int status) {
-    if (!in_interpose_exit) {
-        in_interpose_exit = 1;
-        write_str("\n[MacOBlox Hook] _exit(");
-        print_num(status);
-        write_str(") called!\n[MacOBlox Hook] Backtrace:\n");
-        print_backtrace();
-    }
-    void (*real__exit)(int) = (void (*)(int))dlsym(RTLD_NEXT, "_exit");
-    if (real__exit) real__exit(status);
-    while (1);
-}
-// Disabled: tracing/suppressing _exit changes crash and post-fork semantics.
-
-void my__Exit(int status) {
-    if (!in_interpose_exit) {
-        in_interpose_exit = 1;
-        write_str("\n[MacOBlox Hook] _Exit(");
-        print_num(status);
-        write_str(") called!\n[MacOBlox Hook] Backtrace:\n");
-        print_backtrace();
-    }
-    void (*real__Exit)(int) = (void (*)(int))dlsym(RTLD_NEXT, "_Exit");
-    if (real__Exit) real__Exit(status);
-    while (1);
-}
-// Disabled: tracing/suppressing _Exit changes crash and post-fork semantics.
-
-void my_abort(void) {
-    write_str("\n[MacOBlox Hook] abort() called!\n[MacOBlox Hook] Backtrace:\n");
-    print_backtrace();
-    void (*real_abort)(void) = (void (*)(void))dlsym(RTLD_NEXT, "abort");
-    if (real_abort) real_abort();
-    while (1);
-}
-// Disabled: tracing/suppressing abort changes crash and post-fork semantics.
-
-// Interpose pthread_kill, kill, raise
-extern int pthread_kill(void* thread, int sig);
-int my_pthread_kill(void* thread, int sig) {
-    write_str("\n[MacOBlox Hook] ========================================\n");
-    write_str("[MacOBlox Hook] pthread_kill called with sig: ");
-    print_num(sig);
-    write_str(" for thread: ");
-    print_hex((unsigned long long)thread);
-    write_str("\nBacktrace of caller:\n");
-    print_backtrace();
-    write_str("[MacOBlox Hook] ========================================\n\n");
-    if (sig == 11 || sig == 10 || sig == 6) {
-        write_str("[MacOBlox Hook] Suppressing fatal signal in pthread_kill!\n");
-        return 0;
-    }
-    int (*real_pk)(void*, int) = (int (*)(void*, int))dlsym(RTLD_NEXT, "pthread_kill");
-    return real_pk ? real_pk(thread, sig) : 0;
-}
-// Disabled: tracing/suppressing pthread_kill changes crash and post-fork semantics.
-
-extern int kill(int pid, int sig);
-int my_kill(int pid, int sig) {
-    write_str("\n[MacOBlox Hook] ========================================\n");
-    write_str("[MacOBlox Hook] kill() called with sig: ");
-    print_num(sig);
-    write_str(" for pid: ");
-    print_num(pid);
-    write_str("\nBacktrace of caller:\n");
-    print_backtrace();
-    write_str("[MacOBlox Hook] ========================================\n\n");
-    if (sig == 11 || sig == 10 || sig == 6) {
-        write_str("[MacOBlox Hook] Suppressing fatal signal in kill()!\n");
-        return 0;
-    }
-    int (*real_k)(int, int) = (int (*)(int, int))dlsym(RTLD_NEXT, "kill");
-    return real_k ? real_k(pid, sig) : 0;
-}
-// Disabled: tracing/suppressing kill changes crash and post-fork semantics.
-
-extern int raise(int sig);
-int my_raise(int sig) {
-    write_str("\n[MacOBlox Hook] raise() called with sig: ");
-    print_num(sig);
-    write_str("\nBacktrace of caller:\n");
-    print_backtrace();
-    if (sig == 11 || sig == 10 || sig == 6) {
-        write_str("[MacOBlox Hook] Suppressing fatal signal in raise()!\n");
-        return 0;
-    }
-    int (*real_raise)(int) = (int (*)(int))dlsym(RTLD_NEXT, "raise");
-    return real_raise ? real_raise(sig) : 0;
-}
-// Disabled: tracing/suppressing raise changes crash and post-fork semantics.
-
+// The exception hooks run for every throw and every unwinding step (Lua
+// errors in game scripts are C++ exceptions), so the switch and the real
+// functions are looked up once, not with getenv and dlsym every time.
 static int trace_exceptions_enabled(void) {
-    const char* value = getenv("MACOBLOX_TRACE_EXCEPTIONS");
-    return value && *value == '1';
+    static volatile int enabled = -1;
+    return macoblox_env_cached("MACOBLOX_TRACE_EXCEPTIONS", &enabled);
 }
 
 void my_cxa_throw(void* thrown_exception, void* tinfo, void (*dest)(void*)) {
+    void (*real_throw)(void*, void*, void(*)(void*)) =
+        MACOBLOX_NEXT(void (*)(void*, void*, void(*)(void*)), "__cxa_throw");
     if (!trace_exceptions_enabled()) {
-        void (*real_throw)(void*, void*, void(*)(void*)) =
-            (void (*)(void*, void*, void(*)(void*)))dlsym(RTLD_NEXT, "__cxa_throw");
         if (real_throw) real_throw(thrown_exception, tinfo, dest);
         while (1);
     }
@@ -1343,18 +1283,15 @@ void my_cxa_throw(void* thrown_exception, void* tinfo, void (*dest)(void*)) {
     write_str("[MacOBlox Hook] Backtrace:\n");
     print_backtrace();
     write_str("[MacOBlox Hook] ========================================\n\n");
-
-    void (*real_throw)(void*, void*, void(*)(void*)) = (void (*)(void*, void*, void(*)(void*)))dlsym(RTLD_NEXT, "__cxa_throw");
-    if (real_throw) {
+    if (real_throw)
         real_throw(thrown_exception, tinfo, dest);
-    }
     while (1);
 }
 DYLD_INTERPOSE(my_cxa_throw, __cxa_throw);
 
 void my_objc_exception_throw(id exception) {
+    void (*real_throw)(id) = MACOBLOX_NEXT(void (*)(id), "objc_exception_throw");
     if (!trace_exceptions_enabled()) {
-        void (*real_throw)(id) = (void (*)(id))dlsym(RTLD_NEXT, "objc_exception_throw");
         if (real_throw) real_throw(exception);
         while (1);
     }
@@ -1366,10 +1303,10 @@ void my_objc_exception_throw(id exception) {
         write_str("\n");
     }
     write_str("[MacOBlox Hook] Backtrace:\n");
-    void (*real_throw)(id) = (void (*)(id))dlsym(RTLD_NEXT, "objc_exception_throw");
-    if (real_throw) {
+    print_backtrace();
+    write_str("[MacOBlox Hook] ========================================\n\n");
+    if (real_throw)
         real_throw(exception);
-    }
     while (1);
 }
 DYLD_INTERPOSE(my_objc_exception_throw, objc_exception_throw);
@@ -1377,8 +1314,8 @@ DYLD_INTERPOSE(my_objc_exception_throw, objc_exception_throw);
 // Interpose _Unwind_Resume, __throw_system_error, __cxa_rethrow
 extern void _Unwind_Resume(void*);
 void my_Unwind_Resume(void* exc) {
+    void (*real_fn)(void*) = MACOBLOX_NEXT(void (*)(void*), "_Unwind_Resume");
     if (!trace_exceptions_enabled()) {
-        void (*real_fn)(void*) = (void (*)(void*))dlsym(RTLD_NEXT, "_Unwind_Resume");
         if (real_fn) real_fn(exc);
         while (1);
     }
@@ -1388,7 +1325,6 @@ void my_Unwind_Resume(void* exc) {
     write_str("\nBacktrace:\n");
     print_backtrace();
     write_str("[MacOBlox Hook] ========================================\n\n");
-    void (*real_fn)(void*) = (void (*)(void*))dlsym(RTLD_NEXT, "_Unwind_Resume");
     if (real_fn) real_fn(exc);
     while (1);
 }
@@ -1396,9 +1332,9 @@ DYLD_INTERPOSE(my_Unwind_Resume, _Unwind_Resume);
 
 extern void _ZNSt3__120__throw_system_errorEiPKc(int, const char*);
 void my_throw_system_error(int err, const char* msg) {
+    void (*real_fn)(int, const char*) =
+        MACOBLOX_NEXT(void (*)(int, const char*), "_ZNSt3__120__throw_system_errorEiPKc");
     if (!trace_exceptions_enabled()) {
-        void (*real_fn)(int, const char*) =
-            (void (*)(int, const char*))dlsym(RTLD_NEXT, "_ZNSt3__120__throw_system_errorEiPKc");
         if (real_fn) real_fn(err, msg);
         while (1);
     }
@@ -1410,7 +1346,6 @@ void my_throw_system_error(int err, const char* msg) {
     write_str("\nBacktrace:\n");
     print_backtrace();
     write_str("[MacOBlox Hook] ========================================\n\n");
-    void (*real_fn)(int, const char*) = (void (*)(int, const char*))dlsym(RTLD_NEXT, "_ZNSt3__120__throw_system_errorEiPKc");
     if (real_fn) real_fn(err, msg);
     while (1);
 }
@@ -1418,8 +1353,8 @@ DYLD_INTERPOSE(my_throw_system_error, _ZNSt3__120__throw_system_errorEiPKc);
 
 extern void __cxa_rethrow(void);
 void my_cxa_rethrow(void) {
+    void (*real_fn)(void) = MACOBLOX_NEXT(void (*)(void), "__cxa_rethrow");
     if (!trace_exceptions_enabled()) {
-        void (*real_fn)(void) = (void (*)(void))dlsym(RTLD_NEXT, "__cxa_rethrow");
         if (real_fn) real_fn();
         while (1);
     }
@@ -1427,7 +1362,6 @@ void my_cxa_rethrow(void) {
     write_str("[MacOBlox Hook] __cxa_rethrow called!\nBacktrace:\n");
     print_backtrace();
     write_str("[MacOBlox Hook] ========================================\n\n");
-    void (*real_fn)(void) = (void (*)(void))dlsym(RTLD_NEXT, "__cxa_rethrow");
     if (real_fn) real_fn();
     while (1);
 }
@@ -1489,11 +1423,14 @@ static void crash_handler(int sig, void* info, void* uap) {
     if (info) {
         write_str("[MacOBlox FATAL CRASH] siginfo: ");
         print_hex((unsigned long long)info);
-        unsigned long long* si = (unsigned long long*)info;
-        write_str("\n  si_signo/code: ");
-        print_hex(si[0]);
-        write_str("\n  si_addr (fault addr / sender pid): ");
-        print_hex(si[2]);
+        // Darwin siginfo_t: si_code at byte 8, si_pid at 12, si_addr at 24.
+        const unsigned char* si = (const unsigned char*)info;
+        write_str("\n  si_code: ");
+        print_num(*(const int*)(si + 8));
+        write_str("\n  si_pid: ");
+        print_num(*(const int*)(si + 12));
+        write_str("\n  si_addr: ");
+        print_hex(*(const unsigned long long*)(si + 24));
         write_str("\n");
     }
     if (uap) {
@@ -1516,6 +1453,11 @@ static void crash_handler(int sig, void* info, void* uap) {
             write_str("  RSP: "); print_hex(mc[9]); write_str("\n");
             write_str("  RIP: "); print_hex(mc[18]); write_str("\n");
             write_str("  RFLAGS: "); print_hex(mc[19]); write_str("\n");
+            // Exception state before the registers: trap number, error code
+            // and the faulting address.
+            write_str("  trap: "); print_num(mc[0] & 0xffff);
+            write_str(" err: "); print_hex(mc[0] >> 32);
+            write_str(" fault address: "); print_hex(mc[1]); write_str("\n");
 
             print_addr_info("  Fault RIP info: ", (void*)mc[18]);
             print_addr_info("  RDI info: ", (void*)mc[6]);
@@ -1542,10 +1484,11 @@ int my_sigaction(int sig, const struct darwin_sigaction *act, struct darwin_siga
     write_str(", new handler: ");
     print_hex(act ? (unsigned long long)act->sa_sigaction : 0);
     write_str("\n");
-    int (*real_sigaction)(int, const void*, void*) = (int (*)(int, const void*, void*))dlsym(RTLD_NEXT, "sigaction");
+    int (*real_sigaction)(int, const void*, void*) =
+        MACOBLOX_NEXT(int (*)(int, const void*, void*), "sigaction");
     // Opt-in crash diagnosis only: preserve the application's handlers normally.
-    const char *diagnose = getenv("MACOBLOX_DIAGNOSTIC_SIGNALS");
-    if (diagnose && *diagnose == '1' && sig == 11 && act && real_sigaction) {
+    static volatile int diagnose = -1;
+    if (macoblox_env_cached("MACOBLOX_DIAGNOSTIC_SIGNALS", &diagnose) && sig == 11 && act && real_sigaction) {
         struct darwin_sigaction debug_action = {crash_handler, 0, 0x0040};
         return real_sigaction(sig, &debug_action, oact);
     }
@@ -1643,8 +1586,10 @@ static void macoblox_set_window_icon(id window) {
     if (!macoblox_icon_window)
         return;
     extern int pthread_create(void**, const void*, void* (*)(void*), void*);
+    extern int pthread_detach(void*);
     void* thread;
-    pthread_create(&thread, 0, macoblox_set_window_icon_thread, 0);
+    if (pthread_create(&thread, 0, macoblox_set_window_icon_thread, 0) == 0)
+        pthread_detach(thread);
 }
 
 // Darling draws the macOS menu bar (Roblox, Edit, Window...) inside each
@@ -1689,8 +1634,10 @@ static id keyed_unarchiver_unarchived_object(id cls, SEL cmd, Class expected, id
 }
 
 static void macoblox_install_late_hooks(void);
+static void macoblox_start_xfixes_worker(void);
 static void hooked_app_finish_launching(id self, SEL cmd) {
     macoblox_install_late_hooks();
+    macoblox_start_xfixes_worker(); // ready before the first mouse lock
     orig_app_finish_launching(self, cmd);
 
     id windows = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("windows"));
@@ -1731,10 +1678,10 @@ static void hooked_app_setDelegate(id self, SEL _cmd, id del) {
 }
 
 // Swizzle NSBundle loadNibNamed:owner:
-static int (*orig_loadNibNamed)(id self, SEL _cmd, id name, id owner) = 0;
-static int hooked_loadNibNamed(id self, SEL _cmd, id name, id owner) {
+static signed char (*orig_loadNibNamed)(id self, SEL _cmd, id name, id owner) = 0; // BOOL
+static signed char hooked_loadNibNamed(id self, SEL _cmd, id name, id owner) {
     write_str("\n[MacOBlox Hook] +[NSBundle loadNibNamed:owner:] entered\n");
-    int res = orig_loadNibNamed(self, _cmd, name, owner);
+    signed char res = orig_loadNibNamed(self, _cmd, name, owner);
     write_str("[MacOBlox Hook] +[NSBundle loadNibNamed:owner:] returned: ");
     print_num(res);
     write_str("\n");
@@ -1742,10 +1689,10 @@ static int hooked_loadNibNamed(id self, SEL _cmd, id name, id owner) {
 }
 
 // Swizzle NSNib instantiateNibWithExternalNameTable:
-static int (*orig_instantiateNib)(id self, SEL _cmd, id table) = 0;
-static int hooked_instantiateNib(id self, SEL _cmd, id table) {
+static signed char (*orig_instantiateNib)(id self, SEL _cmd, id table) = 0; // BOOL
+static signed char hooked_instantiateNib(id self, SEL _cmd, id table) {
     write_str("\n[MacOBlox Hook] -[NSNib instantiateNibWithExternalNameTable:] entered\n");
-    int res = orig_instantiateNib(self, _cmd, table);
+    signed char res = orig_instantiateNib(self, _cmd, table);
     write_str("[MacOBlox Hook] -[NSNib instantiateNibWithExternalNameTable:] returned: ");
     print_num(res);
     write_str("\n");
@@ -1758,8 +1705,12 @@ static id (*orig_wt_initWithCoder)(id self, SEL _cmd, id coder) = 0;
 static id hooked_wt_initWithCoder(id self, SEL _cmd, id coder) {
     write_str("[MacOBlox Hook] -[NSWindowTemplate initWithCoder:] START\n");
     in_wt_init = 1;
-    id res = orig_wt_initWithCoder(self, _cmd, coder);
-    in_wt_init = 0;
+    id res = 0;
+    @try {
+        res = orig_wt_initWithCoder(self, _cmd, coder);
+    } @finally {
+        in_wt_init = 0; // or every later decode is logged
+    }
     write_str("[MacOBlox Hook] -[NSWindowTemplate initWithCoder:] END -> ");
     print_hex((unsigned long long)res);
     write_str("\n");
@@ -1769,7 +1720,8 @@ static id hooked_wt_initWithCoder(id self, SEL _cmd, id coder) {
 // Swizzle NSKeyedUnarchiver decodeObjectForKey:
 static id (*orig_decodeObjectForKey)(id self, SEL _cmd, id key) = 0;
 static id hooked_decodeObjectForKey(id self, SEL _cmd, id key) {
-    const char* kstr = key ? (const char*)objc_msgSend(key, sel_registerName("UTF8String")) : 0;
+    const char* kstr = in_wt_init && key
+        ? ((const char* (*)(id, SEL))objc_msgSend)(key, sel_registerName("UTF8String")) : 0;
     if (in_wt_init) {
         write_str("  [WT decodeObjectForKey]: ");
         write_str(kstr ? kstr : "(null)");
@@ -1869,7 +1821,7 @@ static id web_preferences_standard_preferences(id cls, SEL cmd) {
     if (macoblox_standard_web_preferences)
         return macoblox_standard_web_preferences;
     while (__sync_lock_test_and_set(&macoblox_web_preferences_lock, 1))
-        usleep(1000);
+        macoblox_sleep_us(1000);
     if (!macoblox_standard_web_preferences) {
         id preferences = ((id (*)(id, SEL))objc_msgSend)(
             cls, sel_registerName("alloc"));
@@ -2017,19 +1969,17 @@ static void hooked_gl_context_make_current(id self, SEL cmd) {
         macoblox_gl_window_surface = slots[5];
         macoblox_gl_window_egl_context = cgl_slots[9];
     }
-    void* (*current_display)(void) =
-        (void* (*)(void))dlsym(RTLD_NEXT, "eglGetCurrentDisplay");
-    void* (*current_context)(void) =
-        (void* (*)(void))dlsym(RTLD_NEXT, "eglGetCurrentContext");
-    void* (*current_surface)(int) =
-        (void* (*)(int))dlsym(RTLD_NEXT, "eglGetCurrentSurface");
+    if (count <= 5 || count == 60 || count == 600)
+        trace_gl_context("makeCurrentContext", self, count);
+    if (macoblox_gl_hacks_disabled()) // runs every frame: no lookups
+        return;
+    void* (*current_display)(void) = MACOBLOX_NEXT(void* (*)(void), "eglGetCurrentDisplay");
+    void* (*current_context)(void) = MACOBLOX_NEXT(void* (*)(void), "eglGetCurrentContext");
+    void* (*current_surface)(int) = MACOBLOX_NEXT(void* (*)(int), "eglGetCurrentSurface");
     int (*make_current)(void*, void*, void*, void*) =
-        (int (*)(void*, void*, void*, void*))
-            dlsym(RTLD_NEXT, "eglMakeCurrent");
-    unsigned int (*egl_error)(void) =
-        (unsigned int (*)(void))dlsym(RTLD_NEXT, "eglGetError");
-    if (!macoblox_gl_hacks_disabled() &&
-        self && slots[5] && current_display && current_context &&
+        MACOBLOX_NEXT(int (*)(void*, void*, void*, void*), "eglMakeCurrent");
+    unsigned int (*egl_error)(void) = MACOBLOX_NEXT(unsigned int (*)(void), "eglGetError");
+    if (self && slots[5] && current_display && current_context &&
         current_surface && make_current && !current_surface(0x3059)) {
         void* display = current_display();
         void* context = current_context();
@@ -2042,8 +1992,6 @@ static void hooked_gl_context_make_current(id self, SEL cmd) {
         print_hex((unsigned long long)current_surface(0x3059));
         write_str("\n");
     }
-    if (count <= 5 || count == 60 || count == 600)
-        trace_gl_context("makeCurrentContext", self, count);
 }
 
 static void dump_final_program_shaders(int program) {
@@ -2180,8 +2128,8 @@ static void trace_gl_frame_state(long count) {
 
 static void hooked_gl_context_flush(id self, SEL cmd) {
     long count = __sync_add_and_fetch(&macoblox_gl_flush_count, 1);
-    const char* test_clear = getenv("MACOBLOX_GL_TEST_CLEAR");
-    if (test_clear && test_clear[0]) {
+    static volatile int test_clear = -1;
+    if (macoblox_env_cached("MACOBLOX_GL_TEST_CLEAR", &test_clear)) {
         void (*disable)(unsigned int) =
             (void (*)(unsigned int))dlsym(RTLD_NEXT, "glDisable");
         void (*color_mask)(unsigned char, unsigned char, unsigned char,
@@ -2258,15 +2206,15 @@ static void hooked_layer_context_render_layer(id self, SEL cmd, id layer) {
 // ordinary per-event deltas are used; when it drifts more than
 // MACOBLOX_LOCK_RADIUS from the window center it is moved back with a
 // relative XWarpPointer, and the single motion event caused by that warp is
-// dropped. Warp requests during the lock are remembered and applied when the
-// lock ends, as a frozen macOS cursor would stay put.
+// dropped. Roblox's own warp requests during the lock are ignored; when the
+// lock ends the pointer goes back to where the lock began, as a frozen macOS
+// cursor stays put.
 extern int CGAssociateMouseAndMouseCursorPosition(unsigned int connected);
 extern int CGWarpMouseCursorPosition(MacOBloxPoint position);
 #define MACOBLOX_LOCK_RADIUS 100.0
 static volatile int macoblox_pointer_grabbed;
-static volatile int macoblox_pending_warp;
-static MacOBloxPoint macoblox_pending_warp_position;
 static volatile int macoblox_drop_warp_motion;
+static int macoblox_warp_wait_events; // motion events seen since the warp
 static MacOBloxPoint macoblox_expected_warp_delta;
 static volatile long macoblox_associate_mouse_count;
 static MacOBloxPoint macoblox_lock_anchor;
@@ -2298,6 +2246,7 @@ static void macoblox_warp_pointer_by(double dx, double dy) {
         flush(display);
     macoblox_expected_warp_delta.x = ix;
     macoblox_expected_warp_delta.y = iy;
+    macoblox_warp_wait_events = 0;
     macoblox_drop_warp_motion = 1;
 }
 
@@ -2364,11 +2313,20 @@ static MacOBloxPoint macoblox_real_event_location(id event) {
 // the X cursor is hidden with XFixes. The requests go over a private X11
 // socket (xfixes_raw.c), and on a worker thread, so the game thread never
 // waits on X.
+//
+// The worker sleeps in a read of a pipe and wakes when the wanted state
+// changes. It used to poll every 5 ms with Darling's usleep, two
+// darlingserver requests each (400 a second for the whole session), and a
+// hide could lag 5 ms behind the lock. It starts, and opens its connection,
+// when the app finishes launching, not at the first lock.
 extern int macoblox_raw_xfixes_open(void);
 extern int macoblox_raw_xfixes_set_hidden(int hidden);
 extern int pthread_create(void**, const void*, void* (*)(void*), void*);
-extern int usleep(unsigned int);
+extern int pthread_detach(void*);
+extern int pipe(int[2]);
+extern long read(int, void*, unsigned long);
 static volatile int macoblox_cursor_wanted_hidden;
+static int macoblox_cursor_wake[2] = {-1, -1};
 static void* macoblox_xfixes_worker(void* unused) {
     (void)unused;
     if (!macoblox_raw_xfixes_open()) {
@@ -2382,19 +2340,31 @@ static void* macoblox_xfixes_worker(void* unused) {
         if (wanted != applied) {
             macoblox_raw_xfixes_set_hidden(wanted);
             applied = wanted;
+            continue; // it may have changed again meanwhile
         }
-        usleep(5000);
+        char bytes[64];
+        if (read(macoblox_cursor_wake[0], bytes, sizeof bytes) <= 0)
+            macoblox_sleep_us(5000); // no pipe: poll, but without darlingserver
     }
     return 0;
 }
 
-static void macoblox_set_x_cursor_hidden(int hidden) {
+static void macoblox_start_xfixes_worker(void) {
     static volatile int started;
+    if (!__sync_bool_compare_and_swap(&started, 0, 1))
+        return;
+    if (pipe(macoblox_cursor_wake) != 0)
+        macoblox_cursor_wake[0] = macoblox_cursor_wake[1] = -1;
+    void* thread;
+    if (pthread_create(&thread, 0, macoblox_xfixes_worker, 0) == 0)
+        pthread_detach(thread);
+}
+
+static void macoblox_set_x_cursor_hidden(int hidden) {
     macoblox_cursor_wanted_hidden = hidden;
-    if (hidden && __sync_bool_compare_and_swap(&started, 0, 1)) {
-        void* thread;
-        pthread_create(&thread, 0, macoblox_xfixes_worker, 0);
-    }
+    macoblox_start_xfixes_worker();
+    if (macoblox_cursor_wake[1] >= 0)
+        write(macoblox_cursor_wake[1], "w", 1);
 }
 
 static int macoblox_CGAssociateMouseAndMouseCursorPosition(unsigned int connected) {
@@ -2451,7 +2421,6 @@ static int macoblox_CGAssociateMouseAndMouseCursorPosition(unsigned int connecte
         // Put the pointer back where the button was pressed, while it is
         // still hidden, then show it.
         macoblox_pointer_grabbed = 0;
-        macoblox_pending_warp = 0;
         id window = macoblox_lock_window();
         if (window) {
             MacOBloxPoint location = macoblox_real_window_mouse_location(window);
@@ -2467,11 +2436,8 @@ DYLD_INTERPOSE(macoblox_CGAssociateMouseAndMouseCursorPosition,
                CGAssociateMouseAndMouseCursorPosition);
 
 static int macoblox_CGWarpMouseCursorPosition(MacOBloxPoint position) {
-    if (macoblox_pointer_grabbed) {
-        macoblox_pending_warp_position = position;
-        macoblox_pending_warp = 1;
-        return 0;
-    }
+    if (macoblox_pointer_grabbed)
+        return 0; // Roblox warps every frame during the lock
     return CGWarpMouseCursorPosition(position);
 }
 DYLD_INTERPOSE(macoblox_CGWarpMouseCursorPosition, CGWarpMouseCursorPosition);
@@ -2482,12 +2448,8 @@ static double (*orig_mouse_event_delta_x)(id, SEL);
 static double (*orig_mouse_event_delta_y)(id, SEL);
 // MACOBLOX_TRACE_LOCK=1: log every motion event seen during mouse lock.
 static void macoblox_trace_lock_motion(id event, double dx, double dy, const char* action) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char* value = getenv("MACOBLOX_TRACE_LOCK");
-        enabled = value && value[0] ? 1 : 0;
-    }
-    if (!enabled)
+    static volatile int enabled = -1;
+    if (!macoblox_env_cached("MACOBLOX_TRACE_LOCK", &enabled))
         return;
     MacOBloxPoint location = macoblox_real_event_location(event);
     unsigned long type = ((unsigned long (*)(id, SEL))objc_msgSend)(event, sel_registerName("type"));
@@ -2531,6 +2493,12 @@ static int macoblox_filter_locked_motion_inner(id event, double dx, double dy) {
             macoblox_drop_warp_motion = 0;
             return 1;
         }
+        // The warp's motion never came alone (lost, or merged with a fast
+        // movement): recentre again after a few events. Waiting for it
+        // forever stopped the recentring for the rest of the lock, until
+        // the pointer reached the screen edge and the camera stopped turning.
+        if (++macoblox_warp_wait_events > 8)
+            macoblox_drop_warp_motion = 0;
     }
     if (!macoblox_drop_warp_motion) {
         MacOBloxPoint location = macoblox_real_event_location(event);
@@ -2928,7 +2896,7 @@ static id event_add_local_monitor(id cls, SEL cmd, unsigned long long mask,
             stored = 1;
         }
     }
-    macoblox_monitor_lock = 0;
+    __sync_lock_release(&macoblox_monitor_lock);
     write_str("[MacOBlox Input] addLocalMonitorForEventsMatchingMask mask=");
     print_hex(mask);
     write_str(stored ? "\n" : " (table full, ignored)\n");
@@ -2948,16 +2916,19 @@ static void event_remove_monitor(id cls, SEL cmd, id monitor) {
         if (macoblox_monitors[index].block == (struct MacOBloxBlock*)monitor) {
             macoblox_monitors[index].block = 0;
             macoblox_monitors[index].mask = 0;
-            macoblox_monitor_lock = 0;
+            __sync_lock_release(&macoblox_monitor_lock);
             _Block_release(monitor);
             return;
         }
     }
-    macoblox_monitor_lock = 0;
+    __sync_lock_release(&macoblox_monitor_lock);
 }
 
 // Keyboard state for CGEventSourceKeyState, which Darling lacks and Roblox
-// polls in game. Built from the key events AppKit dispatches.
+// polls in game. Built from the key events AppKit dispatches, and cleared
+// when the window loses the keyboard (hooked_post_x_event): X sends the key
+// releases to whoever has it then, so a key held during Alt+Tab stayed
+// "down" (the character kept walking).
 static volatile unsigned char macoblox_key_down[128];
 static void macoblox_track_key_event(id event, unsigned long type) {
     if (type != 10 && type != 11 && type != 12) // keyDown, keyUp, flagsChanged
@@ -3010,11 +2981,16 @@ static void hooked_app_send_event(id self, SEL cmd, id event) {
         for (int index = 0; index < MACOBLOX_MAX_MONITORS; index++) {
             if (macoblox_monitors[index].block &&
                 (macoblox_monitors[index].mask & event_mask))
-                handlers[handler_count++] = macoblox_monitors[index].block;
+                // A reference of our own: a handler may remove a monitor
+                // (and free its block) while the others still run.
+                handlers[handler_count++] = (struct MacOBloxBlock*)_Block_copy(macoblox_monitors[index].block);
         }
-        macoblox_monitor_lock = 0;
-        for (int index = 0; index < handler_count && event; index++)
-            event = handlers[index]->invoke(handlers[index], event);
+        __sync_lock_release(&macoblox_monitor_lock);
+        for (int index = 0; index < handler_count; index++) {
+            if (event)
+                event = handlers[index]->invoke(handlers[index], event);
+            _Block_release(handlers[index]);
+        }
         if (!event)
             return;
     }
@@ -3037,11 +3013,8 @@ static MacOBloxBool hooked_window_accepts_mouse_moved(id self, SEL cmd) {
 static void (*orig_window_send_event)(id, SEL, id) = 0;
 static volatile long macoblox_traced_motion_events;
 static void hooked_window_send_event(id self, SEL cmd, id event) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char* value = getenv("MACOBLOX_TRACE_EVENTS");
-        enabled = value && value[0] ? 1 : 0;
-    }
+    static volatile int enabled = -1;
+    macoblox_env_cached("MACOBLOX_TRACE_EVENTS", &enabled);
     if (enabled && event) {
         unsigned long type = ((unsigned long (*)(id, SEL))objc_msgSend)(
             event, sel_registerName("type"));
@@ -3267,12 +3240,24 @@ static id macoblox_keychain_path(id query) {
     const char* name = ((const char* (*)(id, SEL))objc_msgSend)(account, sel_registerName("UTF8String"));
     if (!name)
         return 0;
-    char hex[512];
+    // The account in hex; past 100 bytes, the first 100 and a hash of the
+    // rest's whole (a file name holds 255 bytes).
+    static const char digits[] = "0123456789abcdef";
+    char hex[260];
     int length = 0;
-    for (const unsigned char* c = (const unsigned char*)name; *c && length < 500; c++) {
-        static const char digits[] = "0123456789abcdef";
-        hex[length++] = digits[*c >> 4];
-        hex[length++] = digits[*c & 15];
+    unsigned long long hash = 1469598103934665603ULL; // FNV-1a
+    unsigned long bytes = 0;
+    for (const unsigned char* c = (const unsigned char*)name; *c; c++, bytes++) {
+        hash = (hash ^ *c) * 1099511628211ULL;
+        if (bytes < 100) {
+            hex[length++] = digits[*c >> 4];
+            hex[length++] = digits[*c & 15];
+        }
+    }
+    if (bytes > 100) {
+        hex[length++] = '-';
+        for (int shift = 60; shift >= 0; shift -= 4)
+            hex[length++] = digits[(hash >> shift) & 15];
     }
     hex[length] = 0;
     id home = ((id (*)(void))dlsym(RTLD_DEFAULT, "NSHomeDirectory"))();
@@ -3284,6 +3269,7 @@ static id macoblox_keychain_path(id query) {
         ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSFileManager"), sel_registerName("defaultManager")),
         sel_registerName("createDirectoryAtPath:withIntermediateDirectories:attributes:error:"),
         directory, 1, 0, 0);
+    chmod(((const char* (*)(id, SEL))objc_msgSend)(directory, sel_registerName("fileSystemRepresentation")), 0700);
     return ((id (*)(id, SEL, id))objc_msgSend)(
         directory, sel_registerName("stringByAppendingPathComponent:"),
         ((id (*)(id, SEL, const char*))objc_msgSend)((id)objc_getClass("NSString"),
@@ -3297,11 +3283,22 @@ static int macoblox_SecItemAdd(id attributes, id* result) {
     id data = ((id (*)(id, SEL, id))objc_msgSend)(attributes, sel_registerName("objectForKey:"), kSecValueData);
     if (!data)
         data = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSData"), sel_registerName("data"));
-    ((MacOBloxBool (*)(id, SEL, id, MacOBloxBool))objc_msgSend)(
+    // Created 0600 before the secret is in it (the write keeps the mode).
+    extern int open(const char*, int, ...);
+    extern int close(int);
+    const char* file = ((const char* (*)(id, SEL))objc_msgSend)(path, sel_registerName("fileSystemRepresentation"));
+    int fd = file ? open(file, 0x1 /* O_WRONLY */ | 0x200 /* O_CREAT */, 0600) : -1;
+    if (fd >= 0)
+        close(fd);
+    chmod(file, 0600);
+    MacOBloxBool written = fd >= 0 && ((MacOBloxBool (*)(id, SEL, id, MacOBloxBool))objc_msgSend)(
         data, sel_registerName("writeToFile:atomically:"), path, 0); // atomic writes are broken in Darling
-    chmod(((const char* (*)(id, SEL))objc_msgSend)(path, sel_registerName("fileSystemRepresentation")), 0600);
     if (result)
         *result = 0;
+    if (!written) {
+        write_str("[MacOBlox Keychain] could not store generic password item\n");
+        return -36; // errSecIO
+    }
     write_str("[MacOBlox Keychain] stored generic password item\n");
     return 0;
 }
@@ -3338,17 +3335,18 @@ DYLD_INTERPOSE(macoblox_SecItemDelete, SecItemDelete);
 // Records the requested OpenGL profile (gl_profile.c); MACOBLOX_TRACE_CGL
 // logs the attributes (Darling's CGL pixel format keeps almost none of them).
 static id (*orig_pixel_format_init)(id, SEL, const unsigned int*) = 0;
-static const unsigned int* macoblox_last_pixel_attributes;
 static id hooked_pixel_format_init(id self, SEL cmd, const unsigned int* attributes) {
     if (macoblox_trace_cgl_enabled()) {
+        // Up to the terminating 0 (the array may be on the caller's stack).
         write_str("[MacOBlox CGL] NSOpenGLPixelFormat attributes:");
-        for (int index = 0; attributes && index < 24; index++) {
+        for (int index = 0; attributes && index < 64; index++) {
             write_str(" ");
             print_num(attributes[index]);
+            if (!attributes[index])
+                break;
         }
         write_str("\n");
     }
-    macoblox_last_pixel_attributes = attributes;
     id result = orig_pixel_format_init(self, cmd, attributes);
     macoblox_note_pixel_format(result, attributes);
     return result;
@@ -3389,7 +3387,18 @@ static id hooked_display_next_event(id self, SEL cmd, unsigned long long mask, i
     (void)cmd;
     id queue = macoblox_event_queue(self);
     SEL count = sel_registerName("count"), object_at = sel_registerName("objectAtIndex:");
-    if (queue && ((unsigned long (*)(id, SEL))objc_msgSend)(queue, count))
+    // No waiting when a matching event is queued. Events of other types may
+    // wait there for someone else: they must not turn every wait into a spin.
+    int matching = 0;
+    if (queue) {
+        macoblox_lock_event_queue();
+        unsigned long total = ((unsigned long (*)(id, SEL))objc_msgSend)(queue, count);
+        for (unsigned long index = 0; index < total && !matching; index++)
+            matching = macoblox_mask_matches(mask, macoblox_event_type(
+                ((id (*)(id, SEL, unsigned long))objc_msgSend)(queue, object_at, index)));
+        macoblox_unlock_event_queue();
+    }
+    if (matching)
         until = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSDate"), sel_registerName("date"));
     id run_loop = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSRunLoop"),
                                                   sel_registerName("currentRunLoop"));
@@ -3417,10 +3426,15 @@ static id hooked_display_next_event(id self, SEL cmd, unsigned long long mask, i
             result = ((id (*)(id, SEL))objc_msgSend)(result, sel_registerName("autorelease"));
     }
     if (!result) {
-        /* As Darling: an NSAppKitSystem event when nothing matches. */
+        /* As Darling: its "no event" placeholder, type 100, which
+         * -[NSApplication nextEventMatchingMask:...] recognizes and keeps
+         * waiting (checked in Darling's AppKit). The type 13 used before is a
+         * real NSEventTypeAppKitDefined event at (0,0): the run loop sent it
+         * to the app and to event monitors, and tracking loops (buttons in
+         * alerts) took it as a mouse event outside and gave up. */
         id event = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSEvent"), sel_registerName("alloc"));
         event = ((id (*)(id, SEL, unsigned long, MacOBloxPoint, unsigned long, id))objc_msgSend)(
-            event, sel_registerName("initWithType:location:modifierFlags:window:"), 13 /* NSAppKitSystem */,
+            event, sel_registerName("initWithType:location:modifierFlags:window:"), 100,
             (MacOBloxPoint){0, 0}, 0, (id)0);
         result = ((id (*)(id, SEL))objc_msgSend)(event, sel_registerName("autorelease"));
     }
@@ -3470,35 +3484,37 @@ static void hooked_display_discard_events(id self, SEL cmd, unsigned long long m
 // late and the camera lagged and jumped (reported on an RTX 3050 laptop).
 // A motion event is skipped when the next queued event is a motion event
 // of the same window and buttons: Darling computes deltas from positions,
-// so the next one carries the skipped movement. Jumps over 48 px (our
-// warps) are never merged, the lock logic needs to see them alone.
+// so the next one carries the skipped movement. While one of our warps is
+// on its way (mouse lock), nothing is merged: the lock logic must see the
+// warp's motion alone. (The 48 px limit below did not ensure that: the
+// warp's own event was merged into the next one whenever that was close.)
 // MACOBLOX_NO_MOTION_COMPRESSION=1 turns this off.
 // MACOBLOX_TRACE_KEYS=1 logs X key presses/releases here and the key events
 // the game gets (sendEvent), to find lost or stuck keys.
 static void (*orig_post_x_event)(id, SEL, void*);
 static int macoblox_trace_keys_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char* value = getenv("MACOBLOX_TRACE_KEYS");
-        enabled = value && value[0] == '1';
-    }
-    return enabled;
+    static volatile int enabled = -1;
+    return macoblox_env_cached("MACOBLOX_TRACE_KEYS", &enabled);
 }
 static void hooked_post_x_event(id self, SEL cmd, void* event) {
     int type = *(int*)event;
     if (type == 6 /* MotionNotify */) {
         static int compression = -1;
-        static int (*pending)(void*);
+        static int (*queued)(void*, int);
         static int (*peek)(void*, void*);
+        static long display_offset = -1;
         if (compression < 0) {
-            const char* value = getenv("MACOBLOX_NO_MOTION_COMPRESSION");
-            pending = (int (*)(void*))dlsym(RTLD_DEFAULT, "XPending");
+            // XEventsQueued(QueuedAlready): only what Xlib has read already;
+            // XPending would flush and read the socket for every motion event.
+            queued = (int (*)(void*, int))dlsym(RTLD_DEFAULT, "XEventsQueued");
             peek = (int (*)(void*, void*))dlsym(RTLD_DEFAULT, "XPeekEvent");
-            compression = !(value && value[0] == '1') && pending && peek;
+            Ivar display_ivar = class_getInstanceVariable(object_getClass(self), "_display");
+            display_offset = display_ivar ? (long)ivar_getOffset(display_ivar) : -1;
+            compression = !macoblox_env_on("MACOBLOX_NO_MOTION_COMPRESSION") && queued && peek &&
+                          display_offset >= 0;
         }
-        Ivar display_ivar = compression ? class_getInstanceVariable(object_getClass(self), "_display") : 0;
-        void* display = display_ivar ? *(void**)((char*)self + ivar_getOffset(display_ivar)) : 0;
-        if (display && pending(display) > 0) {
+        void* display = compression && !macoblox_drop_warp_motion ? *(void**)((char*)self + display_offset) : 0;
+        if (display && queued(display, 0 /* QueuedAlready */) > 0) {
             unsigned char next[192];
             peek(display, next);
             /* XMotionEvent: window at 32, x/y at 64/68, state at 80 */
@@ -3510,6 +3526,12 @@ static void hooked_post_x_event(id self, SEL cmd, void* event) {
                 dx <= 48 && dx >= -48 && dy <= 48 && dy >= -48)
                 return;
         }
+    } else if (type == 10 /* FocusOut */) {
+        /* XFocusChangeEvent: detail at 44. Focus moving into a child window
+         * of ours (NotifyInferior) keeps the keyboard with us. */
+        if (*(int*)((char*)event + 44) != 2 /* NotifyInferior */)
+            for (int key = 0; key < 128; key++)
+                macoblox_key_down[key] = 0;
     } else if ((type == 2 || type == 3) && macoblox_trace_keys_enabled()) {
         /* XKeyEvent: time at 56, keycode at 84 */
         write_str(type == 2 ? "[MacOBlox Keys] X press   keycode=" : "[MacOBlox Keys] X release keycode=");
@@ -3799,6 +3821,17 @@ static id url_file_with_path_relative_to_url(id cls, SEL cmd, id path, id base_u
         cls, sel_registerName("fileURLWithPath:"), combined_path);
 }
 
+static int ascii_equal_case_insensitive(const char* left, const char* right) {
+    for (;; left++, right++) {
+        char a = *left >= 'A' && *left <= 'Z' ? (char)(*left + 32) : *left;
+        char b = *right >= 'A' && *right <= 'Z' ? (char)(*right + 32) : *right;
+        if (a != b)
+            return 0;
+        if (!a)
+            return 1;
+    }
+}
+
 static int ascii_contains_case_insensitive(const char* text, const char* needle) {
     if (!text || !needle || !*needle)
         return 0;
@@ -3820,13 +3853,19 @@ static int ascii_contains_case_insensitive(const char* text, const char* needle)
 }
 
 // Cookies. Roblox on macOS keeps the login (.ROBLOSECURITY) in
-// NSHTTPCookieStorage. Darling's CFNetwork cookie parser crashes on a valid
-// host-only Set-Cookie (it copies a missing Domain), and its cookie storage
-// lives only in memory. So Set-Cookie headers are parsed here, cookies are
-// built with +[NSHTTPCookie cookieWithProperties:] (Domain always set), and
-// persistent cookies are saved to
-// ~/Library/MacOBlox/Cookies.plist (mode 0600) and loaded
-// back at startup.
+// NSHTTPCookieStorage: its HTTP goes through libcurl, and it takes cookies
+// from the storage (cookies, cookiesForURL:) and puts Set-Cookie results
+// back (setCookies:forURL:mainDocumentURL:). Darling gets all of that wrong:
+// its cookie parser crashes on a valid host-only Set-Cookie (it copies a
+// missing Domain), setCookies:forURL:mainDocumentURL: does nothing,
+// cookiesForURL: ignores the URL (every cookie for every URL, login included,
+// also over plain http), and nothing is kept on disk. So Set-Cookie headers
+// are parsed here (cookies built with +[NSHTTPCookie cookieWithProperties:],
+// Domain always set) and the cookies are kept here (macoblox_cookie_store):
+// the newest value wins, a URL gets only the cookies whose domain, path,
+// Secure flag and expiry fit it, and persistent cookies are saved to
+// ~/Library/MacOBlox/Cookies.plist (mode 0600, replaced atomically) and
+// loaded back at startup.
 #define MSG0(r, o, sel) ((r (*)(id, SEL))objc_msgSend)((id)(o), sel_registerName(sel))
 #define MSG1(r, o, sel, a) ((r (*)(id, SEL, id))objc_msgSend)((id)(o), sel_registerName(sel), (a))
 #define MSG2(r, o, sel, a, b) ((r (*)(id, SEL, id, id))objc_msgSend)((id)(o), sel_registerName(sel), (a), (b))
@@ -3858,6 +3897,19 @@ static id macoblox_http_date(id text) {
     }
     MSG0(void, formatter, "release");
     return date;
+}
+
+// Does `host` fall under cookie domain `domain` (both lowercase; a leading
+// dot on the domain is ignored)?
+static int macoblox_domain_matches(id host, id domain) {
+    if (!host || !domain)
+        return 0;
+    if (MSG1(MacOBloxBool, domain, "hasPrefix:", macoblox_nsstring(".")))
+        domain = ((id (*)(id, SEL, unsigned long))objc_msgSend)(domain, sel_registerName("substringFromIndex:"), 1);
+    if (!MSG0(unsigned long, domain, "length"))
+        return 0;
+    return MSG1(MacOBloxBool, host, "isEqualToString:", domain) ||
+           MSG1(MacOBloxBool, host, "hasSuffix:", MSG1(id, macoblox_nsstring("."), "stringByAppendingString:", domain));
 }
 
 // Build one NSHTTPCookie from a single "name=value; attr; attr=value" string.
@@ -3899,6 +3951,10 @@ static id macoblox_cookie_from_string(id line, id url) {
         if (!name)
             continue;
         if (ascii_strings_equal(name, "domain") && MSG0(unsigned long, value, "length")) {
+            // A server may only set cookies for its own domain (RFC 6265).
+            if (host && !macoblox_domain_matches(MSG0(id, host, "lowercaseString"),
+                                                 MSG0(id, value, "lowercaseString")))
+                return 0;
             MSG2(void, properties, "setObject:forKey:", value, macoblox_nsstring("Domain"));
         } else if (ascii_strings_equal(name, "path") && MSG0(unsigned long, value, "length")) {
             MSG2(void, properties, "setObject:forKey:", value, macoblox_nsstring("Path"));
@@ -3963,7 +4019,7 @@ static id cookies_with_response_headers(id cls, SEL cmd, id headers, id url) {
     for (unsigned long index = 0; index < count; index++) {
         id key = ((id (*)(id, SEL, unsigned long))objc_msgSend)(keys, sel_registerName("objectAtIndex:"), index);
         const char* key_text = key ? MSG0(const char*, key, "UTF8String") : 0;
-        if (!key_text || !ascii_contains_case_insensitive(key_text, "set-cookie"))
+        if (!key_text || !ascii_equal_case_insensitive(key_text, "set-cookie"))
             continue;
         id value = MSG1(id, headers, "objectForKey:", key);
         id lines = MSG1(MacOBloxBool, value, "isKindOfClass:", (id)objc_getClass("NSArray"))
@@ -3979,7 +4035,16 @@ static id cookies_with_response_headers(id cls, SEL cmd, id headers, id url) {
     return cookies;
 }
 
+extern int open(const char*, int, ...);
+extern int close(int);
+extern int rename(const char*, const char*);
+extern int unlink(const char*);
+
+// ~/Library/MacOBlox/Cookies.plist, the folder made private (0700).
 static id macoblox_cookie_file(void) {
+    static id file;
+    if (file)
+        return file;
     id home = ((id (*)(void))dlsym(RTLD_DEFAULT, "NSHomeDirectory"))();
     id directory = MSG1(id, home, "stringByAppendingPathComponent:",
                         macoblox_nsstring("Library/MacOBlox"));
@@ -3987,166 +4052,307 @@ static id macoblox_cookie_file(void) {
         MSG0(id, objc_getClass("NSFileManager"), "defaultManager"),
         sel_registerName("createDirectoryAtPath:withIntermediateDirectories:attributes:error:"),
         directory, 1, 0, 0);
-    return MSG1(id, directory, "stringByAppendingPathComponent:", macoblox_nsstring("Cookies.plist"));
+    chmod(MSG0(const char*, directory, "fileSystemRepresentation"), 0700);
+    file = MSG0(id, MSG1(id, directory, "stringByAppendingPathComponent:", macoblox_nsstring("Cookies.plist")),
+                "retain");
+    return file;
 }
 
-static volatile int macoblox_loading_cookies;
-// Persistent cookies as Roblox hands them to NSHTTPCookieStorage, keyed by
-// domain|path|name. Darling's storage cannot be read back for this: in
-// Roblox's process it kept none of them, so the login was never saved.
-static id macoblox_saved_cookies;
+// The store: domain|path|name -> the cookie's properties (as saved), and
+// -> the NSHTTPCookie handed out. Session cookies (no expiry date) are kept
+// only in memory. Roblox's HTTP threads use it at the same time, so every
+// access holds macoblox_cookie_lock; the NSMutableDictionary is not
+// thread-safe.
+static id macoblox_cookie_entries, macoblox_cookie_objects;
+static volatile int macoblox_cookie_lock_word, macoblox_cookie_write_word;
+static void macoblox_cookie_lock(void) {
+    while (__sync_lock_test_and_set(&macoblox_cookie_lock_word, 1))
+        macoblox_sleep_us(50);
+}
+static void macoblox_cookie_unlock(void) { __sync_lock_release(&macoblox_cookie_lock_word); }
+
+static void macoblox_cookie_store_init(void) { // with the lock held
+    if (!macoblox_cookie_entries) {
+        macoblox_cookie_entries = MSG0(id, MSG0(id, objc_getClass("NSMutableDictionary"), "alloc"), "init");
+        macoblox_cookie_objects = MSG0(id, MSG0(id, objc_getClass("NSMutableDictionary"), "alloc"), "init");
+    }
+}
 
 static id macoblox_cookie_key(id domain, id path, id name) {
     return ((id (*)(id, SEL, id, ...))objc_msgSend)(
         (id)objc_getClass("NSString"), sel_registerName("stringWithFormat:"),
-        macoblox_nsstring("%@|%@|%@"), domain ? domain : macoblox_nsstring(""),
+        macoblox_nsstring("%@|%@|%@"), domain ? MSG0(id, domain, "lowercaseString") : macoblox_nsstring(""),
         path ? path : macoblox_nsstring("/"), name ? name : macoblox_nsstring(""));
 }
 
-static void macoblox_write_saved_cookies(void) {
-    id file = macoblox_cookie_file();
-    id entries = MSG0(id, macoblox_saved_cookies, "allValues");
-    ((MacOBloxBool (*)(id, SEL, id, MacOBloxBool))objc_msgSend)(
-        entries, sel_registerName("writeToFile:atomically:"), file, 0); // Darling leaves atomic writes as .tmpN files
-    chmod(MSG0(const char*, file, "fileSystemRepresentation"), 0600);
+static int macoblox_cookie_expired(id expires, id now) {
+    return expires && MSG1(long, expires, "compare:", now) != 1 /* NSOrderedDescending */;
 }
 
-static void macoblox_remember_cookie(id cookie, int deleted) {
-    if (!cookie || macoblox_loading_cookies)
-        return;
-    if (!macoblox_saved_cookies)
-        macoblox_saved_cookies = MSG0(id, MSG0(id, objc_getClass("NSMutableDictionary"), "alloc"), "init");
+// Write the persistent cookies: to Cookies.plist.tmp, created 0600, then
+// renamed over Cookies.plist, so a crash or a kill during the write never
+// leaves a cut-off file (which logged the user out). One writer at a time,
+// and the snapshot is taken by the writer, so the last write is the newest.
+static void macoblox_save_cookies(void) {
+    while (__sync_lock_test_and_set(&macoblox_cookie_write_word, 1))
+        macoblox_sleep_us(1000);
+    @autoreleasepool {
+        id now = MSG0(id, objc_getClass("NSDate"), "date");
+        id persistent = MSG0(id, objc_getClass("NSMutableArray"), "array");
+        macoblox_cookie_lock();
+        @try {
+            id entries = macoblox_cookie_entries ? MSG0(id, macoblox_cookie_entries, "allValues") : 0;
+            unsigned long count = entries ? MSG0(unsigned long, entries, "count") : 0;
+            for (unsigned long index = 0; index < count; index++) {
+                id entry = ((id (*)(id, SEL, unsigned long))objc_msgSend)(entries, sel_registerName("objectAtIndex:"), index);
+                id expires = MSG1(id, entry, "objectForKey:", macoblox_nsstring("Expires"));
+                if (expires && !macoblox_cookie_expired(expires, now))
+                    MSG1(void, persistent, "addObject:", entry);
+            }
+        } @finally {
+            macoblox_cookie_unlock();
+        }
+        id file = macoblox_cookie_file();
+        id temporary = MSG1(id, file, "stringByAppendingString:", macoblox_nsstring(".tmp"));
+        const char* temporary_path = MSG0(const char*, temporary, "fileSystemRepresentation");
+        const char* file_path = MSG0(const char*, file, "fileSystemRepresentation");
+        // Created private before any cookie is in it; the plist write keeps the mode.
+        int fd = open(temporary_path, 0x1 /* O_WRONLY */ | 0x200 /* O_CREAT */ | 0x400 /* O_TRUNC */, 0600);
+        if (fd >= 0) {
+            close(fd);
+            chmod(temporary_path, 0600);
+            if (((MacOBloxBool (*)(id, SEL, id, MacOBloxBool))objc_msgSend)(
+                    persistent, sel_registerName("writeToFile:atomically:"), temporary, 0))
+                rename(temporary_path, file_path); // Darling leaves atomic writes as .tmpN files
+            else
+                unlink(temporary_path);
+        }
+    }
+    __sync_lock_release(&macoblox_cookie_write_word);
+}
+
+// Put `cookie` into the store (or take it out); 1 if a persistent cookie
+// changed, i.e. the file must be written.
+static int macoblox_store_cookie(id cookie, int deleted) {
+    if (!cookie)
+        return 0;
     id name = MSG0(id, cookie, "name");
     id domain = MSG0(id, cookie, "domain");
     id path = MSG0(id, cookie, "path");
+    if (!name || !domain)
+        return 0;
+    if (!path || !MSG0(unsigned long, path, "length"))
+        path = macoblox_nsstring("/");
     id key = macoblox_cookie_key(domain, path, name);
     id expires = MSG0(id, cookie, "expiresDate");
     id now = MSG0(id, objc_getClass("NSDate"), "date");
-    int persistent = expires && MSG1(long, expires, "compare:", now) == 1;
-    write_str("[MacOBlox Cookies] ");
-    write_str(deleted ? "delete " : "set ");
-    write_str(name ? MSG0(const char*, name, "UTF8String") : "?");
-    write_str(" domain=");
-    write_str(domain ? MSG0(const char*, domain, "UTF8String") : "?");
-    write_str(deleted ? "\n" : (persistent ? " persistent\n" : " session\n"));
-    if (deleted || !persistent) {
-        MSG1(void, macoblox_saved_cookies, "removeObjectForKey:", key);
-    } else {
-        id entry = MSG0(id, objc_getClass("NSMutableDictionary"), "dictionary");
+    if (macoblox_cookie_expired(expires, now))
+        deleted = 1; // an expired Set-Cookie is how servers delete cookies
+    id entry = 0, object = 0;
+    if (!deleted) {
+        entry = MSG0(id, objc_getClass("NSMutableDictionary"), "dictionary");
         MSG2(void, entry, "setObject:forKey:", name, macoblox_nsstring("Name"));
-        MSG2(void, entry, "setObject:forKey:", MSG0(id, cookie, "value"), macoblox_nsstring("Value"));
+        id value = MSG0(id, cookie, "value");
+        MSG2(void, entry, "setObject:forKey:", value ? value : macoblox_nsstring(""), macoblox_nsstring("Value"));
         MSG2(void, entry, "setObject:forKey:", domain, macoblox_nsstring("Domain"));
-        MSG2(void, entry, "setObject:forKey:", path ? path : macoblox_nsstring("/"), macoblox_nsstring("Path"));
-        MSG2(void, entry, "setObject:forKey:", expires, macoblox_nsstring("Expires"));
+        MSG2(void, entry, "setObject:forKey:", path, macoblox_nsstring("Path"));
+        if (expires)
+            MSG2(void, entry, "setObject:forKey:", expires, macoblox_nsstring("Expires"));
         id properties = MSG0(id, cookie, "properties");
         id secure = properties ? MSG1(id, properties, "objectForKey:", macoblox_nsstring("Secure")) : 0;
-        int is_secure = secure && MSG1(MacOBloxBool, secure, "respondsToSelector:", (id)sel_registerName("boolValue"))
+        int is_secure = secure && ((MacOBloxBool (*)(id, SEL, SEL))objc_msgSend)(secure, sel_registerName("respondsToSelector:"), sel_registerName("boolValue"))
             && MSG0(MacOBloxBool, secure, "boolValue");
         MSG2(void, entry, "setObject:forKey:", macoblox_cf_boolean(is_secure), macoblox_nsstring("Secure"));
-        MSG2(void, macoblox_saved_cookies, "setObject:forKey:", entry, key);
+        object = MSG1(id, objc_getClass("NSHTTPCookie"), "cookieWithProperties:", entry);
+        if (!object)
+            return 0;
     }
-    macoblox_write_saved_cookies();
+    int changed = 0, persistent_changed = 0;
+    macoblox_cookie_lock();
+    @try {
+        macoblox_cookie_store_init();
+        id old = MSG1(id, macoblox_cookie_entries, "objectForKey:", key);
+        int old_persistent = old && MSG1(id, old, "objectForKey:", macoblox_nsstring("Expires"));
+        if (deleted) {
+            changed = old != 0;
+            persistent_changed = old_persistent;
+            MSG1(void, macoblox_cookie_entries, "removeObjectForKey:", key);
+            MSG1(void, macoblox_cookie_objects, "removeObjectForKey:", key);
+        } else {
+            changed = !old || !MSG1(MacOBloxBool, old, "isEqualToDictionary:", entry);
+            persistent_changed = changed && (old_persistent || expires);
+            if (changed) {
+                MSG2(void, macoblox_cookie_entries, "setObject:forKey:", entry, key);
+                MSG2(void, macoblox_cookie_objects, "setObject:forKey:", object, key);
+            }
+        }
+    } @finally {
+        macoblox_cookie_unlock();
+    }
+    if (changed) { // one write per line: HTTP threads log at the same time
+        char line[300];
+        unsigned long used = 0;
+        const char* parts[] = {"[MacOBlox Cookies] ", deleted ? "delete " : "set ",
+                               MSG0(const char*, name, "UTF8String"), " domain=",
+                               MSG0(const char*, domain, "UTF8String"),
+                               deleted ? "\n" : (expires ? " persistent\n" : " session\n")};
+        for (unsigned index = 0; index < sizeof parts / sizeof parts[0]; index++)
+            for (const char* c = parts[index] ? parts[index] : "?"; *c && used < sizeof line - 2; c++)
+                line[used++] = *c;
+        if (used && line[used - 1] != '\n')
+            line[used++] = '\n';
+        write(2, line, used);
+    }
+    return persistent_changed;
+}
+
+// The store's cookies that fit `url` (all of them without a URL), and after
+// them Darling's own that fit and that the store has no newer value of.
+static id macoblox_cookies_for(id url, id darling_cookies) {
+    id host = url ? MSG0(id, MSG0(id, url, "host"), "lowercaseString") : 0;
+    if (url && !host)
+        return MSG0(id, objc_getClass("NSMutableArray"), "array");
+    id url_path = url ? MSG0(id, url, "path") : 0;
+    if (!url_path || !MSG0(unsigned long, url_path, "length"))
+        url_path = macoblox_nsstring("/");
+    id scheme = url ? MSG0(id, MSG0(id, url, "scheme"), "lowercaseString") : 0;
+    int secure_url = !url || MSG1(MacOBloxBool, scheme, "isEqualToString:", macoblox_nsstring("https")) ||
+                     MSG1(MacOBloxBool, scheme, "isEqualToString:", macoblox_nsstring("wss"));
+    id now = MSG0(id, objc_getClass("NSDate"), "date");
+    id result = MSG0(id, objc_getClass("NSMutableArray"), "array");
+    id names = MSG0(id, objc_getClass("NSMutableSet"), "set");
+    for (int pass = 0; pass < 2; pass++) {
+        id cookies = darling_cookies;
+        if (pass == 0) {
+            macoblox_cookie_lock();
+            @try {
+                cookies = macoblox_cookie_objects ? MSG0(id, macoblox_cookie_objects, "allValues") : 0;
+            } @finally {
+                macoblox_cookie_unlock();
+            }
+        }
+        unsigned long count = cookies ? MSG0(unsigned long, cookies, "count") : 0;
+        for (unsigned long index = 0; index < count; index++) {
+            id cookie = ((id (*)(id, SEL, unsigned long))objc_msgSend)(cookies, sel_registerName("objectAtIndex:"), index);
+            id name = MSG0(id, cookie, "name");
+            if (!name || (pass == 1 && MSG1(MacOBloxBool, names, "containsObject:", name)))
+                continue;
+            if (macoblox_cookie_expired(MSG0(id, cookie, "expiresDate"), now))
+                continue;
+            if (url) {
+                if (!macoblox_domain_matches(host, MSG0(id, MSG0(id, cookie, "domain"), "lowercaseString")))
+                    continue;
+                id path = MSG0(id, cookie, "path");
+                unsigned long length = path ? MSG0(unsigned long, path, "length") : 0;
+                // RFC 6265 path-match: the cookie path, then "/" or the end.
+                if (length && !(MSG1(MacOBloxBool, url_path, "isEqualToString:", path) ||
+                                (MSG1(MacOBloxBool, url_path, "hasPrefix:", path) &&
+                                 (MSG1(MacOBloxBool, path, "hasSuffix:", macoblox_nsstring("/")) ||
+                                  ((unsigned short (*)(id, SEL, unsigned long))objc_msgSend)(
+                                      url_path, sel_registerName("characterAtIndex:"), length) == '/'))))
+                    continue;
+                id properties = MSG0(id, cookie, "properties");
+                id secure = properties ? MSG1(id, properties, "objectForKey:", macoblox_nsstring("Secure")) : 0;
+                if (!secure_url && secure &&
+                    ((MacOBloxBool (*)(id, SEL, SEL))objc_msgSend)(secure, sel_registerName("respondsToSelector:"), sel_registerName("boolValue")) &&
+                    MSG0(MacOBloxBool, secure, "boolValue"))
+                    continue;
+            }
+            MSG1(void, result, "addObject:", cookie);
+            MSG1(void, names, "addObject:", name);
+        }
+    }
+    return result;
 }
 
 static void (*orig_cookie_storage_set)(id, SEL, id) = 0;
 static void hooked_cookie_storage_set(id self, SEL cmd, id cookie) {
     orig_cookie_storage_set(self, cmd, cookie);
-    macoblox_remember_cookie(cookie, 0);
+    int save;
+    @autoreleasepool {
+        save = macoblox_store_cookie(cookie, 0);
+    }
+    if (save)
+        macoblox_save_cookies();
 }
 static void (*orig_cookie_storage_set_many)(id, SEL, id, id, id) = 0;
 static void hooked_cookie_storage_set_many(id self, SEL cmd, id cookies, id url, id main_url) {
     orig_cookie_storage_set_many(self, cmd, cookies, url, main_url);
-    unsigned long count = cookies ? MSG0(unsigned long, cookies, "count") : 0;
-    for (unsigned long index = 0; index < count; index++)
-        macoblox_remember_cookie(((id (*)(id, SEL, unsigned long))objc_msgSend)(
-            cookies, sel_registerName("objectAtIndex:"), index), 0);
+    int save = 0;
+    @autoreleasepool {
+        unsigned long count = cookies ? MSG0(unsigned long, cookies, "count") : 0;
+        for (unsigned long index = 0; index < count; index++)
+            save |= macoblox_store_cookie(((id (*)(id, SEL, unsigned long))objc_msgSend)(
+                cookies, sel_registerName("objectAtIndex:"), index), 0);
+    }
+    if (save)
+        macoblox_save_cookies(); // once per batch
 }
 static void (*orig_cookie_storage_delete)(id, SEL, id) = 0;
 static void hooked_cookie_storage_delete(id self, SEL cmd, id cookie) {
     orig_cookie_storage_delete(self, cmd, cookie);
-    macoblox_remember_cookie(cookie, 1);
+    int save;
+    @autoreleasepool {
+        save = macoblox_store_cookie(cookie, 1);
+    }
+    if (save)
+        macoblox_save_cookies();
 }
 
-// Requests ask cookiesForURL:; add saved cookies that match the URL in case
-// Darling's storage dropped them (it keeps none of Roblox's in practice).
 static id (*orig_cookie_storage_for_url)(id, SEL, id) = 0;
 static id hooked_cookie_storage_for_url(id self, SEL cmd, id url) {
-    id result = orig_cookie_storage_for_url(self, cmd, url);
-    if (!macoblox_saved_cookies || !url)
-        return result;
-    id host = MSG0(id, MSG0(id, url, "host"), "lowercaseString");
-    id url_path = MSG0(id, url, "path");
-    if (!host)
-        return result;
-    int https = MSG1(MacOBloxBool, MSG0(id, MSG0(id, url, "scheme"), "lowercaseString"),
-                     "isEqualToString:", macoblox_nsstring("https"));
-    id merged = result ? MSG0(id, result, "mutableCopy") : MSG0(id, MSG0(id, objc_getClass("NSMutableArray"), "alloc"), "init");
-    id present = MSG0(id, MSG0(id, objc_getClass("NSMutableSet"), "alloc"), "init");
-    unsigned long count = MSG0(unsigned long, merged, "count");
-    for (unsigned long index = 0; index < count; index++) {
-        id cookie = ((id (*)(id, SEL, unsigned long))objc_msgSend)(merged, sel_registerName("objectAtIndex:"), index);
-        MSG1(void, present, "addObject:", MSG0(id, cookie, "name"));
+    id darling = orig_cookie_storage_for_url(self, cmd, url);
+    if (!url)
+        return darling;
+    id result;
+    @autoreleasepool {
+        result = MSG0(id, macoblox_cookies_for(url, darling), "copy");
     }
-    id now = MSG0(id, objc_getClass("NSDate"), "date");
-    id entries = MSG0(id, macoblox_saved_cookies, "allValues");
-    unsigned long entry_count = MSG0(unsigned long, entries, "count");
-    for (unsigned long index = 0; index < entry_count; index++) {
-        id entry = ((id (*)(id, SEL, unsigned long))objc_msgSend)(entries, sel_registerName("objectAtIndex:"), index);
-        id name = MSG1(id, entry, "objectForKey:", macoblox_nsstring("Name"));
-        if (MSG1(MacOBloxBool, present, "containsObject:", name))
-            continue;
-        id expires = MSG1(id, entry, "objectForKey:", macoblox_nsstring("Expires"));
-        if (expires && MSG1(long, expires, "compare:", now) != 1)
-            continue;
-        id domain = MSG0(id, MSG1(id, entry, "objectForKey:", macoblox_nsstring("Domain")), "lowercaseString");
-        id bare = MSG1(MacOBloxBool, domain, "hasPrefix:", macoblox_nsstring("."))
-            ? ((id (*)(id, SEL, unsigned long))objc_msgSend)(domain, sel_registerName("substringFromIndex:"), 1)
-            : domain;
-        int domain_match = MSG1(MacOBloxBool, host, "isEqualToString:", bare) ||
-            MSG1(MacOBloxBool, host, "hasSuffix:",
-                 MSG1(id, macoblox_nsstring("."), "stringByAppendingString:", bare));
-        id path = MSG1(id, entry, "objectForKey:", macoblox_nsstring("Path"));
-        int path_match = !path || !url_path || !MSG0(unsigned long, url_path, "length") ||
-            MSG1(MacOBloxBool, url_path, "hasPrefix:", path);
-        id secure = MSG1(id, entry, "objectForKey:", macoblox_nsstring("Secure"));
-        int needs_https = secure && MSG0(MacOBloxBool, secure, "boolValue");
-        if (!domain_match || !path_match || (needs_https && !https))
-            continue;
-        id cookie = MSG1(id, objc_getClass("NSHTTPCookie"), "cookieWithProperties:", entry);
-        if (cookie) {
-            MSG1(void, merged, "addObject:", cookie);
-            MSG1(void, present, "addObject:", name);
-        }
-    }
-    MSG0(void, present, "release");
-    return MSG0(id, merged, "autorelease");
+    return MSG0(id, result, "autorelease");
 }
 
+static id (*orig_cookie_storage_cookies)(id, SEL) = 0;
+static id hooked_cookie_storage_cookies(id self, SEL cmd) {
+    id darling = orig_cookie_storage_cookies(self, cmd);
+    id result;
+    @autoreleasepool {
+        result = MSG0(id, macoblox_cookies_for(0, darling), "copy");
+    }
+    return MSG0(id, result, "autorelease");
+}
+
+// Only into this store, not Darling's: Darling hands out every cookie it
+// has for every URL.
 static void macoblox_load_cookies(void) {
-    id storage = MSG0(id, objc_getClass("NSHTTPCookieStorage"), "sharedHTTPCookieStorage");
-    id entries = MSG1(id, objc_getClass("NSArray"), "arrayWithContentsOfFile:", macoblox_cookie_file());
-    unsigned long count = entries ? MSG0(unsigned long, entries, "count") : 0;
-    id now = MSG0(id, objc_getClass("NSDate"), "date");
     int loaded = 0;
-    macoblox_loading_cookies = 1;
-    for (unsigned long index = 0; index < count; index++) {
-        id entry = ((id (*)(id, SEL, unsigned long))objc_msgSend)(entries, sel_registerName("objectAtIndex:"), index);
-        id expires = MSG1(id, entry, "objectForKey:", macoblox_nsstring("Expires"));
-        if (expires && MSG1(long, expires, "compare:", now) != 1 /* NSOrderedDescending */)
-            continue;
-        id cookie = MSG1(id, objc_getClass("NSHTTPCookie"), "cookieWithProperties:", entry);
-        if (cookie) {
-            MSG1(void, storage, "setCookie:", cookie);
-            if (!macoblox_saved_cookies)
-                macoblox_saved_cookies = MSG0(id, MSG0(id, objc_getClass("NSMutableDictionary"), "alloc"), "init");
-            MSG2(void, macoblox_saved_cookies, "setObject:forKey:", entry,
-                 macoblox_cookie_key(MSG1(id, entry, "objectForKey:", macoblox_nsstring("Domain")),
-                                     MSG1(id, entry, "objectForKey:", macoblox_nsstring("Path")),
-                                     MSG1(id, entry, "objectForKey:", macoblox_nsstring("Name"))));
-            loaded++;
+    @autoreleasepool {
+        id entries = MSG1(id, objc_getClass("NSArray"), "arrayWithContentsOfFile:", macoblox_cookie_file());
+        unsigned long count = entries ? MSG0(unsigned long, entries, "count") : 0;
+        id now = MSG0(id, objc_getClass("NSDate"), "date");
+        macoblox_cookie_lock();
+        @try {
+            macoblox_cookie_store_init();
+            for (unsigned long index = 0; index < count; index++) {
+                id entry = ((id (*)(id, SEL, unsigned long))objc_msgSend)(entries, sel_registerName("objectAtIndex:"), index);
+                if (!MSG1(MacOBloxBool, entry, "isKindOfClass:", (id)objc_getClass("NSDictionary")))
+                    continue;
+                id expires = MSG1(id, entry, "objectForKey:", macoblox_nsstring("Expires"));
+                if (!expires || macoblox_cookie_expired(expires, now))
+                    continue;
+                id cookie = MSG1(id, objc_getClass("NSHTTPCookie"), "cookieWithProperties:", entry);
+                if (!cookie)
+                    continue;
+                id key = macoblox_cookie_key(MSG1(id, entry, "objectForKey:", macoblox_nsstring("Domain")),
+                                             MSG1(id, entry, "objectForKey:", macoblox_nsstring("Path")),
+                                             MSG1(id, entry, "objectForKey:", macoblox_nsstring("Name")));
+                MSG2(void, macoblox_cookie_entries, "setObject:forKey:", entry, key);
+                MSG2(void, macoblox_cookie_objects, "setObject:forKey:", cookie, key);
+                loaded++;
+            }
+        } @finally {
+            macoblox_cookie_unlock();
         }
     }
-    macoblox_loading_cookies = 0;
     write_str("[MacOBlox Cookies] loaded ");
     print_num(loaded);
     write_str(" saved cookies\n");
@@ -4162,7 +4368,7 @@ static id shared_current_display(id cls, SEL cmd) {
     if (macoblox_shared_display)
         return macoblox_shared_display;
     while (__sync_lock_test_and_set(&macoblox_display_lock, 1))
-        usleep(1000);
+        macoblox_sleep_us(1000);
     if (!macoblox_shared_display) {
         id display = orig_current_display(cls, cmd);
         if (display)
@@ -4344,6 +4550,11 @@ static void install_swizzles(void) {
                 orig_cookie_storage_for_url = (id (*)(id, SEL, id))method_getImplementation(for_url);
                 method_setImplementation(for_url, (IMP)hooked_cookie_storage_for_url);
             }
+            Method all = class_getInstanceMethod(storage_class, sel_registerName("cookies"));
+            if (all) {
+                orig_cookie_storage_cookies = (id (*)(id, SEL))method_getImplementation(all);
+                method_setImplementation(all, (IMP)hooked_cookie_storage_cookies);
+            }
             Method set_many = class_getInstanceMethod(
                 storage_class, sel_registerName("setCookies:forURL:mainDocumentURL:"));
             if (set_many) {
@@ -4481,7 +4692,7 @@ static void install_swizzles(void) {
     if (bndlCls) {
         Method mNib = class_getClassMethod(bndlCls, sel_registerName("loadNibNamed:owner:"));
         if (mNib) {
-            orig_loadNibNamed = (int (*)(id, SEL, id, id))method_getImplementation(mNib);
+            orig_loadNibNamed = (signed char (*)(id, SEL, id, id))method_getImplementation(mNib);
             method_setImplementation(mNib, (IMP)hooked_loadNibNamed);
             write_str("[MacOBlox] Hooked NSBundle loadNibNamed:owner:\n");
         }
@@ -4491,7 +4702,7 @@ static void install_swizzles(void) {
     if (nibCls) {
         Method mInst = class_getInstanceMethod(nibCls, sel_registerName("instantiateNibWithExternalNameTable:"));
         if (mInst) {
-            orig_instantiateNib = (int (*)(id, SEL, id))method_getImplementation(mInst);
+            orig_instantiateNib = (signed char (*)(id, SEL, id))method_getImplementation(mInst);
             method_setImplementation(mInst, (IMP)hooked_instantiateNib);
             write_str("[MacOBlox] Hooked NSNib instantiateNibWithExternalNameTable:\n");
         }
@@ -4570,7 +4781,9 @@ const void* NSHTTPCookiePath = @"Path";
 const void* NSHTTPCookieSecure = @"Secure";
 const void* NSHTTPCookieValue = @"Value";
 const void* NSHTTPCookieVersion = @"Version";
-const void* NSLocalizedDescriptionKey = @"NSLocalizedDescriptionKey";
+// Foundation's value (Darling's CoreFoundation exports the same string; with
+// a flat namespace this definition wins, so it must be equal).
+const void* NSLocalizedDescriptionKey = @"NSLocalizedDescription";
 const void* NSProcessInfoThermalStateDidChangeNotification = @"NSProcessInfoThermalStateDidChangeNotification";
 const void* NSProcessInfoPowerStateDidChangeNotification = @"NSProcessInfoPowerStateDidChangeNotification";
 
@@ -4588,28 +4801,36 @@ static id macoblox_keyboard_source;
 static id macoblox_keyboard_layout_data;
 static id macoblox_keyboard_languages;
 
+// Built by one thread; the source is published last, so a thread that sees
+// it also sees the layout data (another thread used to get a NULL layout,
+// the very crash this avoids).
 static void macoblox_initialize_keyboard_source(void) {
-    if (macoblox_keyboard_source)
+    static volatile int state; // 0 new, 1 building, 2 done
+    if (state == 2)
         return;
-
+    if (!__sync_bool_compare_and_swap(&state, 0, 1)) {
+        while (state != 2)
+            macoblox_sleep_us(100);
+        return;
+    }
     Class object_class = objc_getClass("NSObject");
     Class data_class = objc_getClass("NSMutableData");
     Class array_class = objc_getClass("NSArray");
-    if (!object_class || !data_class || !array_class)
-        return;
-
-    macoblox_keyboard_source = ((id (*)(id, SEL))objc_msgSend)(
-        (id)object_class, sel_registerName("new"));
-
-    id data = ((id (*)(id, SEL, unsigned long))objc_msgSend)(
-        (id)data_class, sel_registerName("dataWithLength:"), 4096UL);
-    macoblox_keyboard_layout_data = data
-        ? ((id (*)(id, SEL))objc_msgSend)(data, sel_registerName("retain")) : 0;
-
-    id languages = ((id (*)(id, SEL, id))objc_msgSend)(
-        (id)array_class, sel_registerName("arrayWithObject:"), @"en");
-    macoblox_keyboard_languages = languages
-        ? ((id (*)(id, SEL))objc_msgSend)(languages, sel_registerName("retain")) : 0;
+    if (object_class && data_class && array_class) {
+        id data = ((id (*)(id, SEL, unsigned long))objc_msgSend)(
+            (id)data_class, sel_registerName("dataWithLength:"), 4096UL);
+        macoblox_keyboard_layout_data = data
+            ? ((id (*)(id, SEL))objc_msgSend)(data, sel_registerName("retain")) : 0;
+        id languages = ((id (*)(id, SEL, id))objc_msgSend)(
+            (id)array_class, sel_registerName("arrayWithObject:"), @"en");
+        macoblox_keyboard_languages = languages
+            ? ((id (*)(id, SEL))objc_msgSend)(languages, sel_registerName("retain")) : 0;
+        id source = ((id (*)(id, SEL))objc_msgSend)((id)object_class, sel_registerName("new"));
+        __sync_synchronize();
+        macoblox_keyboard_source = source;
+    }
+    __sync_synchronize();
+    state = 2;
 }
 
 void* TISCopyCurrentKeyboardInputSource(void) {
