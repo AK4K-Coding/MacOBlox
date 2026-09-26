@@ -52,7 +52,6 @@ RU = {
     "Unknown Studio package manifest format": "Неизвестный формат манифеста пакетов Studio",
     "{name} failed its checksum": "{name} не прошёл проверку контрольной суммы",
     "Open last log": "Открыть последний лог",
-    "Could not start: {error}": "Не удалось запустить: {error}",
     "Roblox exited with code {status}": "Roblox завершился с кодом {status}",
     # Fast flags
     "FPS limit": "Лимит FPS",
@@ -102,6 +101,8 @@ RU = {
     "Custom server": "Свой сервер",
     "IP address, optionally with :port. Plain DNS, not encrypted.":
         "IP-адрес, можно с :портом. Обычный DNS, без шифрования.",
+    "Custom DNS server must look like 9.9.9.9, 9.9.9.9:53 or [2620:fe::fe]:53":
+        "Свой DNS-сервер пишется так: 9.9.9.9, 9.9.9.9:53 или [2620:fe::fe]:53",
     # Settings: language
     "Interface": "Интерфейс",
     "Language": "Язык",
@@ -114,8 +115,10 @@ RU = {
     "The latest version is installed": "Установлена последняя версия",
     "Update to {version}": "Обновить до {version}",
     "Close Roblox first": "Сначала закрой Roblox",
-    "Update failed: {error}": "Обновление не удалось: {error}",
+    "Please wait, the launcher is busy": "Подожди, лаунчер ещё занят",
+    "Darling could not create its prefix in {path}": "Darling не смог создать префикс в {path}",
     "Roblox updated, the old version is in backups/": "Roblox обновлён, старая версия в backups/",
+    "Roblox installed": "Roblox установлен",
     "Downloading {done} of {total} MB": "Загрузка {done} из {total} МБ",
     "Unpacking": "Распаковка",
     "Done": "Готово",
@@ -129,6 +132,10 @@ RU = {
         "Сохранённая сессия Roblox будет удалена, при следующем запуске нужно будет войти заново.",
     "Sign out of Roblox": "Выйти",
     "Session deleted": "Сессия удалена",
+    "Could not sign out": "Не удалось выйти",
+    "The saved session is still there. Press Restart Darling in Diagnostics and try again.":
+        "Сохранённая сессия осталась на месте. Нажми «Перезапустить Darling» в разделе «Диагностика» "
+        "и попробуй ещё раз.",
     # Settings: diagnostics
     "Diagnostics": "Диагностика",
     "Detailed logs for debugging. They slow the game down, enable only when needed.":
@@ -141,14 +148,16 @@ RU = {
     "Frame rate in the log": "FPS в логе",
     "Keyboard tracing": "Трассировка клавиатуры",
     "Open logs folder": "Открыть папку с логами",
+    "Could not open the logs folder: {error}": "Не удалось открыть папку с логами: {error}",
     "Rebuild shim": "Пересобрать шим",
     "Building the shim…": "Собираю шим…",
     "Shim built": "Шим собран",
     "The shim comes built with this package": "Шим в этом пакете уже собран",
-    "Build failed, details in the terminal": "Сборка не удалась, подробности в терминале",
+    "Could not build the shim": "Не удалось собрать шим",
     "Could not build the shim:\n{output}": "Не удалось собрать шим:\n{output}",
     "Restart Darling": "Перезапустить Darling",
     "Darling stopped, it starts with the next game": "Darling остановлен, запустится при следующей игре",
+    "Could not restart Darling: {error}": "Не удалось перезапустить Darling: {error}",
     # Info
     "Mac O’ Blox runs the real Roblox client for macOS on Linux through Darling. "
     "It is not made by Roblox and is not affiliated with it.":

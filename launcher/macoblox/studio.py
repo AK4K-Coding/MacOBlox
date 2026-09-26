@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import time
+import urllib.parse
 import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -92,8 +93,14 @@ def _state():
         return {}
 
 
-def _save_state(state):
+def _private_root():
+    """ROOT holds Studio's saved sign-in (in the Wine prefix): only for this user."""
     ROOT.mkdir(parents=True, exist_ok=True)
+    ROOT.chmod(0o700)
+
+
+def _save_state(state):
+    _private_root()
     STATE.write_text(json.dumps(state, indent=2))
 
 
@@ -113,7 +120,9 @@ def _latest_tag(releases):
         return response.url.rstrip("/").rsplit("/", 1)[1]
 
 
-def _download(url, target, progress=None, label=""):
+def _download(url, target, progress=None, label="", digest=None):
+    """Download `url` to `target`, feeding `digest` (a hashlib object) as it
+    goes. A connection that ends early raises instead of leaving a short file."""
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_name(target.name + ".part")
     with _open(url, timeout=60) as response, open(partial, "wb") as out:
@@ -121,10 +130,15 @@ def _download(url, target, progress=None, label=""):
         done = 0
         while chunk := response.read(1 << 16):
             out.write(chunk)
+            if digest:
+                digest.update(chunk)
             done += len(chunk)
             if progress and total:
                 progress(done / total, _("{label}: {done} of {total} MB", label=label,
                                          done=done >> 20, total=total >> 20))
+    if total and done != total:
+        partial.unlink(missing_ok=True)
+        raise OSError(f"{url}: got {done} of {total} bytes")
     partial.replace(target)
     return target
 
@@ -169,6 +183,7 @@ def _ensure_prefix(state, progress):
     _wine("wineboot", "--init", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     subprocess.run([str(WINE / "bin" / "wineserver"), "--wait"], env=_wine_env())
     state["prefix"] = state["wine"]
+    state.pop("dxvk", None)  # a new prefix needs DXVK's DLLs again
     _save_state(state)
 
 
@@ -237,8 +252,12 @@ def _install_studio(state, version, progress):
         name, md5, _size = package
         archive = folder / name
         for _attempt in range(3):
-            _download(PACKAGE_URL.format(version=version, name=name), archive)
-            if hashlib.md5(archive.read_bytes()).hexdigest() == md5:
+            digest = hashlib.md5()  # hashed while downloading: no second read
+            try:
+                _download(PACKAGE_URL.format(version=version, name=name), archive, digest=digest)
+            except OSError:
+                continue
+            if digest.hexdigest() == md5:
                 return package, archive
         raise RuntimeError(_("{name} failed its checksum", name=name))
 
@@ -261,6 +280,7 @@ def install(progress=lambda fraction, text: None):
     """Installs or updates everything Studio needs. progress(fraction, text)
     gets the fraction of the whole job."""
     state = _state()
+    _private_root()
     steps = [(0.00, 0.20, lambda p: _ensure_wine(state, p)),
              (0.20, 0.25, lambda p: _ensure_prefix(state, p)),
              (0.25, 0.30, lambda p: _ensure_dxvk(state, p))]
@@ -281,9 +301,20 @@ def running():
     return any(re.search(r"RobloxStudioBeta\.exe", args) for _pid, args in core._user_processes())
 
 
+def _wine_argument(argument):
+    """A place file as Studio under Wine must get it (Z: is the Linux root),
+    also when a file manager passes a file:// URL; links stay as they are."""
+    if argument.startswith("file://"):
+        argument = urllib.parse.unquote(urllib.parse.urlsplit(argument).path)
+    if argument.startswith("/") and os.path.isfile(argument):
+        return "Z:" + argument.replace("/", "\\")
+    return argument
+
+
 def launch(arguments=()):
     """Starts Studio; arguments are roblox-studio: or roblox-studio-auth:
     links and place files, passed on like the Windows protocol handler."""
+    arguments = [_wine_argument(argument) for argument in arguments]
     core.LOGS.mkdir(parents=True, exist_ok=True)
     old = sorted(core.LOGS.glob("studio-*.log"), key=lambda path: path.stat().st_mtime)
     for path in old[:-9]:

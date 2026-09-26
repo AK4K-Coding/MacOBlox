@@ -1,10 +1,12 @@
 """Backend of the Mac O’ Blox launcher: paths, settings, fast flags, Roblox
 updates and running the macOS client through Darling. No GTK here."""
 
+import hashlib
 import json
 import os
 import plistlib
 import re
+import resource
 import shutil
 import signal
 import struct
@@ -97,17 +99,40 @@ TRACE_ENV = {
 
 
 def load_settings():
+    """Settings with defaults for anything missing. A stored value of the
+    wrong type (a hand edit, a damaged file) falls back to its default rather
+    than failing every launch later."""
     settings = dict(DEFAULT_SETTINGS)
     try:
-        settings.update(json.loads(SETTINGS_FILE.read_text()))
+        stored = json.loads(SETTINGS_FILE.read_text())
     except (OSError, ValueError):
-        pass
+        stored = {}
+    if not isinstance(stored, dict):
+        return settings
+    for key, value in stored.items():
+        default = DEFAULT_SETTINGS.get(key)
+        if isinstance(default, bool):
+            valid = isinstance(value, bool)
+        elif isinstance(default, (int, float)):
+            valid = isinstance(value, (int, float)) and not isinstance(value, bool)
+            value = type(default)(value) if valid else value
+        else:
+            valid = default is None or isinstance(value, type(default))
+        if valid:
+            settings[key] = value
     return settings
 
 
+def _write_atomically(path, text):
+    """Replace `path` in one step, so a crash or a full disk leaves the old file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(text)
+    temporary.replace(path)
+
+
 def save_settings(settings):
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    SETTINGS_FILE.write_text(json.dumps(settings, indent=2, ensure_ascii=False))
+    _write_atomically(SETTINGS_FILE, json.dumps(settings, indent=2, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------- fast flags
@@ -121,8 +146,7 @@ def load_fast_flags():
 
 
 def save_fast_flags(flags):
-    FAST_FLAGS.parent.mkdir(parents=True, exist_ok=True)
-    FAST_FLAGS.write_text(json.dumps(flags, indent=2, ensure_ascii=False))
+    _write_atomically(FAST_FLAGS, json.dumps(flags, indent=2, ensure_ascii=False))
 
 
 def parse_flag_value(text):
@@ -148,9 +172,10 @@ def format_flag_value(value):
 def installed_version():
     try:
         with open(APP_BUNDLE / "Contents" / "Info.plist", "rb") as file:
-            return plistlib.load(file).get("CFBundleShortVersionString")
-    except (OSError, plistlib.InvalidFileException):
+            version = plistlib.load(file).get("CFBundleShortVersionString")
+    except Exception:  # missing or damaged: plistlib raises several kinds
         return None
+    return version if isinstance(version, str) else None
 
 
 def latest_version():
@@ -163,50 +188,74 @@ def latest_version():
 
 def update_roblox(upload, progress=None):
     """Download the official macOS client and swap it in, keeping fast flags.
-    The previous bundle is moved to backups/. progress(fraction, text)."""
+    The previous bundle is moved to backups/, and that path is returned (None
+    when there was no client before). progress(fraction, text)."""
     DOWNLOADS.mkdir(parents=True, exist_ok=True)
     archive = DOWNLOADS / f"{upload}-RobloxPlayer.zip"
     request = urllib.request.Request(DOWNLOAD_URL.format(upload=upload),
                                      headers={"User-Agent": "MacOBlox"})
-    with urllib.request.urlopen(request, timeout=30) as response, open(archive, "wb") as out:
-        total = int(response.headers.get("Content-Length") or 0)
-        done = 0
-        while chunk := response.read(1 << 16):
-            out.write(chunk)
-            done += len(chunk)
-            if progress and total:
-                progress(done / total * 0.9, _("Downloading {done} of {total} MB",
-                                                  done=done >> 20, total=total >> 20))
-    if not zipfile.is_zipfile(archive):
-        raise RuntimeError(_("The download is not a zip archive"))
-    if progress:
-        progress(0.92, _("Unpacking"))
-    unpack = Path(tempfile.mkdtemp(prefix="unpack-", dir=DOWNLOADS))
-    # unzip keeps the executable bits, zipfile does not.
-    subprocess.run(["unzip", "-q", str(archive), "-d", str(unpack)], check=True)
-    new_bundle = unpack / "RobloxPlayer.app"
-    if not new_bundle.is_dir():
-        raise RuntimeError(_("The archive has no RobloxPlayer.app"))
-    flags = load_fast_flags()
-    old_version = installed_version() or "unknown"
-    BACKUPS.mkdir(parents=True, exist_ok=True)
-    backup = BACKUPS / f"RobloxPlayer-{old_version}.app"
-    if backup.exists():
-        shutil.rmtree(backup)
-    if APP_BUNDLE.exists():
-        APP_BUNDLE.rename(backup)
-    new_bundle.rename(APP_BUNDLE)
-    shutil.rmtree(unpack, ignore_errors=True)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response, open(archive, "wb") as out:
+            total = int(response.headers.get("Content-Length") or 0)
+            done = 0
+            while chunk := response.read(1 << 16):
+                out.write(chunk)
+                done += len(chunk)
+                if progress and total:
+                    progress(done / total * 0.9, _("Downloading {done} of {total} MB",
+                                                      done=done >> 20, total=total >> 20))
+    except BaseException:
+        archive.unlink(missing_ok=True)  # no half-downloaded client left behind
+        raise
+    # Unpack next to the bundle: the swap below is a rename, which fails
+    # across filesystems (downloads/ may be a link to another disk).
+    unpack = Path(tempfile.mkdtemp(prefix=".unpack-", dir=DATA_DIR))
+    try:
+        if not zipfile.is_zipfile(archive):
+            raise RuntimeError(_("The download is not a zip archive"))
+        if progress:
+            progress(0.92, _("Unpacking"))
+        # unzip keeps the executable bits, zipfile does not.
+        subprocess.run(["unzip", "-q", str(archive), "-d", str(unpack)], check=True)
+        new_bundle = unpack / "RobloxPlayer.app"
+        if not new_bundle.is_dir():
+            raise RuntimeError(_("The archive has no RobloxPlayer.app"))
+        flags = load_fast_flags()
+        old_version = installed_version() or "unknown"
+        BACKUPS.mkdir(parents=True, exist_ok=True)
+        backup = BACKUPS / f"RobloxPlayer-{old_version}.app"
+        if backup.exists():
+            shutil.rmtree(backup)
+        had_bundle = APP_BUNDLE.exists()
+        if had_bundle:
+            APP_BUNDLE.rename(backup)
+        try:
+            new_bundle.rename(APP_BUNDLE)
+        except OSError:
+            if had_bundle:
+                backup.rename(APP_BUNDLE)  # never leave the user without a client
+            raise
+    finally:
+        shutil.rmtree(unpack, ignore_errors=True)
+        archive.unlink(missing_ok=True)
+    if had_bundle:
+        # Keep only the newest backup: each is a whole client of several
+        # hundred MB. (Not on a first install: an older backup may then be
+        # the only other client there is.)
+        for old in BACKUPS.glob("RobloxPlayer-*.app"):
+            if old != backup:
+                shutil.rmtree(old, ignore_errors=True)
     if flags:
         save_fast_flags(flags)
     if progress:
         progress(1.0, _("Done"))
-    return backup
+    return backup if had_bundle else None
 
 
 # ----------------------------------------------------------------- processes
 
-def _user_processes():
+def _user_commands():
+    """(pid, argv) of this user's processes."""
     uid = os.getuid()
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
@@ -214,21 +263,24 @@ def _user_processes():
         try:
             if entry.stat().st_uid != uid:
                 continue
-            args = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
         except OSError:
             continue
-        yield int(entry.name), args
+        yield int(entry.name), [arg.decode(errors="replace") for arg in argv if arg]
 
 
-def roblox_pids():
-    """Host PIDs of running RobloxPlayer / RobloxCrashHandler processes."""
-    pids = []
-    for pid, args in _user_processes():
-        if args.startswith("darling shell"):
-            continue
-        if "RobloxPlayer" in args.split(" ", 1)[0] or "RobloxCrashHandler" in args:
-            pids.append(pid)
-    return pids
+def _user_processes():
+    """(pid, command line joined by spaces) of this user's processes."""
+    for pid, argv in _user_commands():
+        yield pid, " ".join(argv)
+
+
+def roblox_pids(names=("RobloxPlayer", "RobloxCrashHandler")):
+    """Host PIDs of running RobloxPlayer / RobloxCrashHandler processes: the
+    macOS executables themselves (Studio's RobloxCrashHandler.exe under Wine,
+    or any program that merely mentions these names, does not count)."""
+    return [pid for pid, argv in _user_commands()
+            if argv and argv[0].rsplit("/", 1)[-1] in names]
 
 
 def _darlingservers():
@@ -237,25 +289,149 @@ def _darlingservers():
             if args.startswith(f"darlingserver {DARLING_PREFIX} ")]
 
 
-def darlingserver_running():
-    return bool(_darlingservers())
+def _mount_namespace(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/ns/mnt")
+    except OSError:
+        return None
 
 
-def stop_roblox():
-    pids = roblox_pids()
+def _darling_processes():
+    """(pid, mount namespace) of this user's Darling processes: every macOS
+    program, Darling's daemons included, runs under the mldr loader."""
+    found = []
+    for pid, _argv in _user_commands():
+        try:
+            if os.readlink(f"/proc/{pid}/exe").rsplit("/", 1)[-1] == "mldr":
+                found.append((pid, _mount_namespace(pid)))
+        except OSError:
+            pass
+    return found
+
+
+def _container_processes(servers):
+    """Darling processes in the containers of the darlingservers `servers`
+    (a container is a mount namespace; launchd and the daemons are not
+    darlingserver's children)."""
+    namespaces = {_mount_namespace(pid) for pid in servers} - {None}
+    return [pid for pid, namespace in _darling_processes() if namespace in namespaces]
+
+
+def _orphaned_darling_processes():
+    """Darling processes whose darlingserver is gone, of any prefix: launchd
+    and the daemons of a server that was stopped or died stay behind, a few
+    hundred MB each time, and a game still running there is dead anyway."""
+    servers = [pid for pid, argv in _user_commands() if argv and argv[0] == "darlingserver"]
+    alive = {_mount_namespace(pid) for pid in servers} - {None}
+    return [pid for pid, namespace in _darling_processes() if namespace not in alive]
+
+
+def _terminate(pids, wait=5.0):
+    """SIGTERM `pids`, and SIGKILL those still there after `wait` seconds."""
     for pid in pids:
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
-    deadline = time.time() + 3
-    while time.time() < deadline and roblox_pids():
-        time.sleep(0.2)
-    for pid in roblox_pids():
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline and any(_process_state(pid) not in (None, "Z") for pid in pids):
+        time.sleep(0.1)
+    for pid in pids:
+        if _process_state(pid) not in (None, "Z"):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def clear_orphaned_darling():
+    """End Darling processes left over from a darlingserver that is gone."""
+    orphans = _orphaned_darling_processes()
+    if orphans:
+        _terminate(orphans)
+    return len(orphans)
+
+
+# Nice values. Darling runs the game at about -4, while darlingserver,
+# Darling's daemons (launchd, notifyd... all "mldr") and the audio player
+# inherit the launcher's nice value, +10 when the desktop starts apps niced.
+# The game waits on darlingserver for most of its system calls and on the
+# player for every audio period; niced below the game, they got about a
+# twentieth of its CPU share while it kept the cores busy: frame times of
+# seconds, network stalls, crackling and silent audio.
+SERVER_NICE = -5
+PLAYER_NICE = -11
+
+
+def _nice_target(nice):
+    """`nice`, or the lowest nice value RLIMIT_NICE lets this user set."""
+    soft = resource.getrlimit(resource.RLIMIT_NICE)[0]
+    return nice if soft == resource.RLIM_INFINITY else max(nice, 20 - soft)
+
+
+def _raise_priority(pid, nice):
+    """Give every thread of `pid` (Linux keeps nice values per thread) the
+    nice value `nice` if that is better than its own; True if it was set."""
+    try:
+        current = os.getpriority(os.PRIO_PROCESS, pid)
+        threads = [int(tid) for tid in os.listdir(f"/proc/{pid}/task")]
+    except OSError:
+        return False
+    if nice >= current:
+        return False
+    done = False
+    for tid in threads:
         try:
-            os.kill(pid, signal.SIGKILL)
+            os.setpriority(os.PRIO_PROCESS, tid, nice)
+            done = True
         except OSError:
             pass
+    return done
+
+
+def _with_descendants(roots):
+    """`roots` and every process below them."""
+    children = {}
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdigit():
+            try:
+                stat = (entry / "stat").read_text()
+                parent = int(stat.rsplit(")", 1)[1].split()[1])
+            except (OSError, ValueError, IndexError):
+                continue
+            children.setdefault(parent, []).append(int(entry.name))
+    found, pending = [], list(roots)
+    while pending:
+        pid = pending.pop()
+        found.append(pid)
+        pending.extend(children.get(pid, []))
+    return found
+
+
+def raise_darling_priority():
+    """Raise darlingserver and every process under it (Darling's daemons;
+    the game, already better, stays as it is) to SERVER_NICE. Returns how
+    many processes changed."""
+    target = _nice_target(SERVER_NICE)
+    return sum(_raise_priority(pid, target) for pid in _with_descendants(_darlingservers()))
+
+
+def darlingserver_running():
+    return bool(_darlingservers())
+
+
+def darling_environment():
+    """Environment for every `darling` command the launcher runs."""
+    env = dict(os.environ)
+    # Darling's Mesa receives X11 displays; a Wayland session may say otherwise.
+    env["EGL_PLATFORM"] = "x11"
+    if NOROOT_LIB:
+        env["LD_PRELOAD"] = NOROOT_LIB
+    return env
+
+
+def stop_roblox():
+    _terminate(roblox_pids(), wait=3)
 
 
 def _darling_path(path):
@@ -268,7 +444,7 @@ def signed_in():
     try:
         with open(SESSION_FILES[0], "rb") as file:
             cookies = plistlib.load(file)
-    except (OSError, plistlib.InvalidFileException, ValueError):
+    except Exception:  # missing or damaged (plistlib raises several kinds)
         return False
     return any(isinstance(c, dict) and c.get("Name") == ".ROBLOSECURITY" and c.get("Value")
                for c in cookies if isinstance(cookies, list))
@@ -291,25 +467,33 @@ def exit_reason(log_path):
 
 
 def logout():
+    """Delete the saved Roblox session. Returns True when it is gone.
+    Blocks up to a minute: call it off the GTK thread."""
     # Files inside ~/.darling must not be removed from the host while
     # darlingserver runs: its overlay then stops showing new files to the host.
     if darlingserver_running():
-        subprocess.run(["darling", "shell", "/bin/rm", "-rf",
-                        *[_darling_path(path) for path in SESSION_FILES]],
-                       env=dict(os.environ, EGL_PLATFORM="x11"), stdin=subprocess.DEVNULL,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
-        return
-    for path in SESSION_FILES:
-        if path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
-        elif path.exists():
-            path.unlink()
+        try:
+            subprocess.run(["darling", "shell", "/bin/rm", "-rf",
+                            *[_darling_path(path) for path in SESSION_FILES]],
+                           env=darling_environment(), stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        for path in SESSION_FILES:
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                elif path.exists():
+                    path.unlink()
+            except OSError:
+                pass
+    return not any(path.exists() for path in SESSION_FILES)
 
 
 def cleanup_logs(keep):
     """Remove old logs written by the launcher itself (launch-YYYYmmdd-HHMMSS.log);
     logs from run_debug.sh and other tools are left alone."""
-    import re
     pattern = re.compile(r"launch-\d{8}-\d{6}\.log")
     logs = sorted((p for p in LOGS.glob("launch-*.log") if pattern.fullmatch(p.name)),
                   key=lambda p: p.stat().st_mtime, reverse=True)
@@ -320,18 +504,48 @@ def cleanup_logs(keep):
             pass
 
 
+SHIM_STAMP = BUILD_DIR / "sources.sha256"
+
+
+def _shim_sources_hash():
+    """Hash of everything the shim build uses, and of the launcher version."""
+    digest = hashlib.sha256(__version__.encode())
+    for path in sorted([*PROJECT.glob("*.c"), *PROJECT.glob("*.m"),
+                        *(PROJECT / "frameworks").glob("*"), BUILD_SCRIPT]):
+        try:
+            digest.update(path.name.encode() + b"\0" + path.read_bytes())
+        except OSError:
+            pass
+    return digest.hexdigest()
+
+
 def build_shim():
     if PREBUILT_SHIM:
         return True, _("The shim comes built with this package")
+    stamp = _shim_sources_hash()
     result = subprocess.run([str(BUILD_SCRIPT)], capture_output=True, text=True,
                             env=dict(os.environ, MACOBLOX_BUILD_DIR=str(BUILD_DIR),
                                      DARLING_SYSROOT=str(DARLING_SYSROOT)))
+    if result.returncode == 0:
+        try:
+            _write_atomically(SHIM_STAMP, stamp + "\n")
+        except OSError:
+            pass
     return result.returncode == 0, (result.stdout + result.stderr).strip()
 
 
 def shim_built():
-    return SHIM.exists() and all((FRAMEWORKS_BUILD / f"{name}.framework" / name).exists()
-                                 for name in FRAMEWORKS)
+    """Built, and from the current sources: after a launcher update (git
+    pull, a package upgrade) the next start rebuilds the shim."""
+    if not (SHIM.exists() and all((FRAMEWORKS_BUILD / f"{name}.framework" / name).exists()
+                                  for name in FRAMEWORKS)):
+        return False
+    if PREBUILT_SHIM:
+        return True
+    try:
+        return SHIM_STAMP.read_text().strip() == _shim_sources_hash()
+    except OSError:
+        return False
 
 
 def missing_tools():
@@ -346,10 +560,39 @@ def missing_tools():
 
 
 def _missing_frameworks():
+    """Stub frameworks the prefix lacks, or holds in an older build."""
     relative = Path("System/Library/Frameworks")
-    return [name for name in FRAMEWORKS
-            if not (DARLING_PREFIX / relative / f"{name}.framework").exists()
-            and not (DARLING_SYSROOT / relative / f"{name}.framework").exists()]
+    missing = []
+    for name in FRAMEWORKS:
+        if (DARLING_SYSROOT / relative / f"{name}.framework").exists():
+            continue  # Darling has the real one
+        binary = Path(f"{name}.framework") / "Versions" / "A" / name
+        try:
+            if (DARLING_PREFIX / relative / binary).read_bytes() == (FRAMEWORKS_BUILD / binary).read_bytes():
+                continue
+        except OSError:
+            pass
+        missing.append(name)
+    return missing
+
+
+def _install_framework(name):
+    """Put the fresh build of a stub framework into the prefix. Copying it
+    over the old copy failed on the old copy's symlinks (File exists), so it
+    is copied next to it and swapped in."""
+    frameworks = DARLING_PREFIX / "System" / "Library" / "Frameworks"
+    target = frameworks / f"{name}.framework"
+    staged = frameworks / f".{name}.framework.new"
+    old = frameworks / f".{name}.framework.old"
+    frameworks.mkdir(parents=True, exist_ok=True)
+    for leftover in (staged, old):  # from an interrupted earlier run
+        if leftover.is_dir() and not leftover.is_symlink():
+            shutil.rmtree(leftover)
+    shutil.copytree(FRAMEWORKS_BUILD / f"{name}.framework", staged, symlinks=True)
+    if target.exists() or target.is_symlink():
+        target.rename(old)
+    staged.rename(target)
+    shutil.rmtree(old, ignore_errors=True)
 
 
 def prepare_prefix(env):
@@ -364,15 +607,17 @@ def prepare_prefix(env):
         return
     if not DARLING_PREFIX.is_dir():
         # Let Darling create the prefix first.
-        subprocess.run(["darling", "shell", "/bin/true"], env=env, stdin=subprocess.DEVNULL,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+        try:
+            subprocess.run(["darling", "shell", "true"], env=env, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if not DARLING_PREFIX.is_dir():
+            raise RuntimeError(_("Darling could not create its prefix in {path}", path=DARLING_PREFIX))
     if darlingserver_running():
         restart_darling()
-    target = DARLING_PREFIX / "System" / "Library" / "Frameworks"
-    target.mkdir(parents=True, exist_ok=True)
     for name in frameworks:
-        shutil.copytree(FRAMEWORKS_BUILD / f"{name}.framework", target / f"{name}.framework",
-                        symlinks=True, dirs_exist_ok=True)
+        _install_framework(name)
     for relative, path in bridges:
         target = DARLING_PREFIX / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -396,7 +641,7 @@ def _initializer_offset(data):
     ncmds = struct.unpack_from("<I", data, slice_offset + 16)[0]
     position = slice_offset + 32
     segments, symtab = [], None
-    for _ in range(ncmds):
+    for _command in range(ncmds):
         command, size = struct.unpack_from("<II", data, position)
         if command == 0x19:  # LC_SEGMENT_64
             segments.append(struct.unpack_from("<4Q", data, position + 24))
@@ -467,15 +712,19 @@ def _process_state(pid):
 
 
 def clear_stale_darling():
-    """If the container's init is gone or a zombie (its parent never reaped
-    it), darling refuses to start ("Cannot open mnt namespace file"); move
-    its pid file and socket aside so a new server starts."""
+    """If the container's init (darlingserver, whose PID is in .init.pid) is
+    gone or a zombie, darling refuses to start ("Cannot open mnt namespace
+    file"); move its pid file and socket aside so a new server starts. After
+    a reboot the PID may belong to an unrelated process: only one of our
+    prefix's darlingservers counts as alive."""
     prefix = DARLING_PREFIX
     try:
         pid = int((prefix / ".init.pid").read_text().strip())
-    except (OSError, ValueError):
+    except OSError:
         return
-    if _process_state(pid) not in (None, "Z"):
+    except ValueError:
+        pid = None
+    if pid is not None and pid in _darlingservers():
         return
     for name in (".init.pid", ".darlingserver.sock"):
         path = prefix / name
@@ -484,24 +733,18 @@ def clear_stale_darling():
 
 
 def restart_darling():
-    """Stops the prefix's darlingserver and its launchd, which otherwise
-    stays behind as an orphan; the next darling command starts them again."""
-    try:
-        init = int((DARLING_PREFIX / ".init.pid").read_text().strip())
-    except (OSError, ValueError):
-        init = None
-    for pid in _darlingservers():
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-    time.sleep(2)
-    if init and _process_state(init) not in (None, "Z"):
-        try:
-            os.kill(init, signal.SIGTERM)
-        except OSError:
-            pass
-        time.sleep(1)
+    """Stops the prefix's darlingserver and everything in its container
+    (launchd, Darling's daemons, a game still closing), and whatever earlier
+    servers left behind; the next darling command starts them again. The
+    daemons are not darlingserver's children: stopping only its descendants
+    left them running without a server. Blocks for up to a few seconds: call
+    it off the GTK thread."""
+    servers = _darlingservers()
+    processes = set(_with_descendants(servers)) | set(_container_processes(servers))
+    processes |= set(_orphaned_darling_processes())
+    # The container's programs first, so none of them runs on without its server.
+    _terminate(sorted(processes - set(servers)))
+    _terminate(servers)
     clear_stale_darling()
 
 
@@ -571,6 +814,29 @@ class HostAudio:
 
     def __init__(self, fifo, keep, player):
         self.fifo, self.keep, self.player = fifo, keep, player
+        self.restarted_at = 0.0
+
+    @classmethod
+    def _spawn(cls, fifo):
+        command = cls._player_command(fifo)
+        # Audio before the game (see PLAYER_NICE); `nice` takes a relative value.
+        change = _nice_target(PLAYER_NICE) - os.getpriority(os.PRIO_PROCESS, 0)
+        if change < 0 and shutil.which("nice"):
+            command = ["nice", "-n", str(change), *command]
+        return subprocess.Popen(
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def keep_playing(self):
+        """Restart the player if it has exited (PipeWire restarted, say):
+        the game keeps writing into the FIFO and would stay silent."""
+        if self.player.poll() is None or time.time() - self.restarted_at < 5:
+            return
+        self.restarted_at = time.time()
+        if self._player_command(self.fifo):
+            try:
+                self.player = self._spawn(self.fifo)
+            except OSError:
+                pass
 
     @classmethod
     def _player_command(cls, fifo):
@@ -598,18 +864,22 @@ class HostAudio:
             fifo.unlink()
         os.mkfifo(fifo, 0o600)
         keep = os.open(fifo, os.O_RDWR)
-        player = subprocess.Popen(
-            cls._player_command(fifo),
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return cls(fifo, keep, player)
+        return cls(fifo, keep, cls._spawn(fifo))
 
     def stop(self):
+        # pw-cat sits in a blocking read on the FIFO and only sees SIGTERM
+        # once that returns: closing the last writer ends the read (end of
+        # file). A player that still hangs is killed and reaped.
+        os.close(self.keep)
         self.player.terminate()
         try:
-            self.player.wait(timeout=3)
+            self.player.wait(timeout=2)
         except subprocess.TimeoutExpired:
             self.player.kill()
-        os.close(self.keep)
+            try:
+                self.player.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
         try:
             self.fifo.unlink()
         except OSError:
@@ -625,16 +895,13 @@ class RobloxSession:
         self.process = None
         self.seen_roblox = False
         self.gone_since = None
+        self.game_pids = []
+        self.scanned_at = 0.0
         self.dns = None
         self.audio = None
 
     def environment(self):
-        env = dict(os.environ)
-        # Darling's Mesa receives X11 displays; a Wayland session may say otherwise.
-        env["EGL_PLATFORM"] = "x11"
-        if NOROOT_LIB:
-            env["LD_PRELOAD"] = NOROOT_LIB
-        return env
+        return darling_environment()
 
     def shim_variables(self):
         variables = [f"MACOBLOX_MOUSE_SENSITIVITY={self.settings['mouse_sensitivity']:.2f}"]
@@ -660,6 +927,14 @@ class RobloxSession:
         return variables
 
     def start(self):
+        """Start the client; on failure nothing started is left running."""
+        try:
+            self._start()
+        except BaseException:
+            self.finish()
+            raise
+
+    def _start(self):
         missing = missing_tools()
         if missing:
             raise RuntimeError(_("Install these first: {programs}", programs=", ".join(missing)))
@@ -668,6 +943,16 @@ class RobloxSession:
             if not ok:
                 raise RuntimeError(_("Could not build the shim:\n{output}", output=output))
         env = self.environment()
+        # A game closed a moment ago may still be shutting down. A new one next
+        # to it shared its darlingserver, and when that went both died. Give it
+        # time, then end it; crash handlers of earlier games are just ended.
+        deadline = time.monotonic() + 20
+        while roblox_pids(("RobloxPlayer",)) and time.monotonic() < deadline:
+            time.sleep(0.25)
+        leftover = roblox_pids()
+        if leftover:
+            _terminate(leftover, wait=3)
+        orphans = clear_orphaned_darling()
         prepare_prefix(env)
         provider = self.settings.get("dns", "system")
         if provider != "system" and (provider != "custom" or self.settings.get("dns_custom")):
@@ -678,21 +963,27 @@ class RobloxSession:
         if not darlingserver_running():
             # The first process after darlingserver starts sometimes fails to
             # check in; warm the server up with a trivial command first.
-            subprocess.run(["darling", "shell", "/bin/true"], env=env, stdin=subprocess.DEVNULL,
+            subprocess.run(["darling", "shell", "true"], env=env, stdin=subprocess.DEVNULL,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
         LOGS.mkdir(parents=True, exist_ok=True)
         cleanup_logs(int(self.settings.get("keep_logs", 30)) - 1)
         self.log_path = LOGS / time.strftime("launch-%Y%m%d-%H%M%S.log")
-        log = open(self.log_path, "wb")
-        log.write(f"Mac O’ Blox {__version__}\n".encode())
-        log.flush()
-        command = ["darling", "shell", "/bin/bash", "-c", LAUNCH_SCRIPT, "macoblox",
-                   f"/Volumes/SystemRoot{DATA_DIR}", f"/Volumes/SystemRoot{SHIM.parent}",
-                   *self.shim_variables()]
-        self.process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
-                                        stdout=log, stderr=subprocess.STDOUT,
-                                        start_new_session=True)
-        log.close()
+        with open(self.log_path, "wb") as log:
+            log.write(f"Mac O’ Blox {__version__}\n".encode())
+            if leftover:
+                log.write(f"Ended {len(leftover)} Roblox process(es) of an earlier game\n".encode())
+            if orphans:
+                log.write(f"Ended {orphans} Darling process(es) left without their darlingserver\n".encode())
+            changed = raise_darling_priority()
+            if changed:
+                log.write(f"Priority: {changed} Darling processes raised to nice {_nice_target(SERVER_NICE)}\n".encode())
+            log.flush()
+            command = ["darling", "shell", "/bin/bash", "-c", LAUNCH_SCRIPT, "macoblox",
+                       f"/Volumes/SystemRoot{DATA_DIR}", f"/Volumes/SystemRoot{SHIM.parent}",
+                       *self.shim_variables()]
+            self.process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
+                                            stdout=log, stderr=subprocess.STDOUT,
+                                            start_new_session=True)
 
     def poll(self):
         """None while running, otherwise the exit status (or -1 if unknown)."""
@@ -700,9 +991,17 @@ class RobloxSession:
         if status is not None:
             self.finish()
             return status
+        if self.audio:
+            self.audio.keep_playing()
         # darling shell can outlive a Roblox that was killed; watch the game
-        # processes themselves as well.
-        if roblox_pids():
+        # processes themselves as well. Known ones are checked each second,
+        # the whole of /proc only when they are gone or every few seconds.
+        now = time.time()
+        self.game_pids = [pid for pid in self.game_pids if _process_state(pid) not in (None, "Z")]
+        if not self.game_pids or now - self.scanned_at > 5:
+            self.game_pids = roblox_pids()
+            self.scanned_at = now
+        if self.game_pids:
             self.seen_roblox = True
             self.gone_since = None
         elif self.seen_roblox:
@@ -713,6 +1012,16 @@ class RobloxSession:
         return None
 
     def finish(self):
+        if self.process and self.process.poll() is None:
+            # Roblox is gone but `darling shell` stayed: end it (it leads its
+            # own process group) instead of leaving it behind.
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(self.process.pid, sig)
+                    self.process.wait(timeout=3)
+                    break
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
         if self.dns:
             self.dns.stop()
             self.dns = None

@@ -10,7 +10,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
-from . import __version__, author, core, i18n, studio  # noqa: E402
+from . import __version__, author, core, dns, i18n, studio  # noqa: E402
 from .i18n import _  # noqa: E402
 
 APP_ID = "xyz.narez.MacOBlox"
@@ -139,9 +139,11 @@ class PlayPage(Gtk.Box):
         version.add_css_class("dim-label")
         version.add_css_class("caption")
         self.append(version)
-        self.refresh(running=window.session is not None)
+        self.refresh()
 
-    def refresh(self, running=False):
+    def refresh(self):
+        running = self.window.session is not None
+        busy = self.window.busy
         version = core.installed_version()
         parts = [_("Roblox {version}", version=version) if version else _("Roblox not found")]
         parts.append(_("Darling running") if core.darlingserver_running()
@@ -149,9 +151,11 @@ class PlayPage(Gtk.Box):
         if version and not running and not core.signed_in():
             parts.append(_("Sign in with Quick Login"))
         self.status.set_description(" · ".join(parts))
-        self.play.set_sensitive(not running)
+        self.play.set_sensitive(not running and not busy)
         if running:
             self.play.set_label(_("Roblox is running"))
+        elif busy == "starting":
+            self.play.set_label(_("Starting…"))
         else:
             self.play.set_label(_("Play") if version else _("Install Roblox"))
         self.stop.set_visible(running)
@@ -164,6 +168,8 @@ class FlagsPage(Adw.PreferencesPage):
         self.window = window
         self.flags = core.load_fast_flags()
         self.preset_flags = set()
+        self.preset_setters = {}  # flag -> function(value) that shows it in its row
+        self._save_timer = 0
 
         presets = Adw.PreferencesGroup(
             title=_("Popular"),
@@ -220,6 +226,17 @@ class FlagsPage(Adw.PreferencesPage):
 
             switch.connect("notify::active", apply)
             row.connect("notify::value", lambda *_args: switch.get_active() and apply())
+
+            def set_number(value):
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    return False
+                row.set_value(value)
+                switch.set_active(True)
+                apply()
+                return True
+
+            for name in names:
+                self.preset_setters[name] = set_number
             return row
         row = Adw.SwitchRow(title=_(preset["title"]), subtitle=preset["subtitle"], active=enabled)
 
@@ -232,6 +249,18 @@ class FlagsPage(Adw.PreferencesPage):
             self._save()
 
         row.connect("notify::active", toggle)
+
+        def set_fixed(value, name):
+            if value == preset["value"]:
+                row.set_active(True)
+            else:
+                # Not this preset's value: keep it as a plain flag.
+                self.flags[name] = value
+                self._save()
+            return True
+
+        for name in names:
+            self.preset_setters[name] = lambda value, n=name: set_fixed(value, n)
         return row
 
     # -- custom flags
@@ -305,24 +334,43 @@ class FlagsPage(Adw.PreferencesPage):
                 _toast(self.window.toasts, _("This is not a JSON object with flags"))
                 return
             existing = {entry["name"].get_text(): entry for entry in self.custom_rows}
+            imported = 0
             for name, value in data.items():
                 if name in self.preset_flags:
+                    # Popular flags live in their own rows above.
+                    imported += self.preset_setters[name](value)
                     continue
                 if name in existing:
                     existing[name]["value"].set_text(core.format_flag_value(value))
                 else:
                     self._add_custom_row(name, core.format_flag_value(value))
+                imported += 1
             self._sync_custom()
-            _toast(self.window.toasts, _("Imported flags: {count}", count=len(data)))
+            _toast(self.window.toasts, _("Imported flags: {count}", count=imported))
 
         dialog.connect("response", response)
         dialog.present(self.window)
 
     def _save(self):
+        """Save shortly after the last change: typing a value or spinning a
+        number would otherwise rewrite the file on every keystroke."""
+        if self._save_timer:
+            GLib.source_remove(self._save_timer)
+        self._save_timer = GLib.timeout_add(300, self._save_now)
+
+    def _save_now(self):
+        self._save_timer = 0
         try:
             core.save_fast_flags(self.flags)
         except OSError as error:
             _toast(self.window.toasts, _("Could not save flags: {error}", error=error))
+        return False
+
+    def flush(self):
+        """Write a pending change now (Roblox reads the file when it starts)."""
+        if self._save_timer:
+            GLib.source_remove(self._save_timer)
+            self._save_now()
 
 
 class SettingsPage(Adw.PreferencesPage):
@@ -363,7 +411,7 @@ class SettingsPage(Adw.PreferencesPage):
         game.add(reopen)
         self.add(game)
 
-        dns = Adw.PreferencesGroup(
+        dns_group = Adw.PreferencesGroup(
             title=_("DNS for Roblox"),
             description=_("Only Roblox uses this server, the rest of the system keeps its own DNS. "
                           "Helps when some Roblox images or servers do not load."))
@@ -383,11 +431,22 @@ class SettingsPage(Adw.PreferencesPage):
             window.set_setting("dns", code)
             custom.set_visible(code == "custom")
 
+        def custom_applied(row):
+            text = row.get_text().strip()
+            try:
+                dns.parse_server(text)
+            except ValueError as error:
+                row.add_css_class("error")
+                _toast(window.toasts, str(error))
+                return
+            row.remove_css_class("error")
+            window.set_setting("dns_custom", text)
+
         server.connect("notify::selected", dns_changed)
-        custom.connect("apply", lambda row: window.set_setting("dns_custom", row.get_text().strip()))
-        dns.add(server)
-        dns.add(custom)
-        self.add(dns)
+        custom.connect("apply", custom_applied)
+        dns_group.add(server)
+        dns_group.add(custom)
+        self.add(dns_group)
 
         roblox = Adw.PreferencesGroup(title="Roblox")
         self.version_row = Adw.ActionRow(title=_("Installed version"),
@@ -423,8 +482,7 @@ class SettingsPage(Adw.PreferencesPage):
             row.connect("notify::active", lambda r, _pspec, k=key: window.set_setting(k, r.get_active()))
             diagnostics.add(row)
         logs = _button_row(_("Open logs folder"))
-        logs.connect("activated", lambda *_args: Gio.AppInfo.launch_default_for_uri(
-            core.LOGS.as_uri(), None))
+        logs.connect("activated", lambda *_args: self.open_logs())
         diagnostics.add(logs)
         rebuild = _button_row(_("Rebuild shim"))
         rebuild.connect("activated", lambda *_args: self.rebuild())
@@ -433,6 +491,13 @@ class SettingsPage(Adw.PreferencesPage):
         restart.connect("activated", lambda *_args: self.restart_darling())
         diagnostics.add(restart)
         self.add(diagnostics)
+
+    def open_logs(self):
+        try:
+            core.LOGS.mkdir(parents=True, exist_ok=True)  # none before the first game
+            Gio.AppInfo.launch_default_for_uri(core.LOGS.as_uri(), None)
+        except (OSError, GLib.Error) as error:
+            _toast(self.window.toasts, _("Could not open the logs folder: {error}", error=error))
 
     def _in_thread(self, work, done):
         def run():
@@ -473,17 +538,22 @@ class SettingsPage(Adw.PreferencesPage):
         self._in_thread(core.latest_version, done)
 
     def install_update(self, upload):
-        if self.window.session:
-            _toast(self.window.toasts, _("Close Roblox first"))
+        if not self.window.begin("updating"):
             return
         self.update_button.set_sensitive(False)
         self.progress.set_visible(True)
+        shown = [-1.0, ""]
 
         def progress(fraction, text):
+            # One update per half percent, not two per 64 KiB chunk.
+            if fraction - shown[0] < 0.005 and text[:12] == shown[1][:12] and fraction < 1:
+                return
+            shown[:] = [fraction, text]
             GLib.idle_add(self.progress.set_fraction, fraction)
             GLib.idle_add(self.progress.set_text, text)
 
-        def done(_backup, error):
+        def done(backup, error):
+            self.window.end()
             self.update_button.set_sensitive(True)
             self._set_update_action(_("Check for updates"), self.check_updates)
             self.progress.set_visible(False)
@@ -492,7 +562,8 @@ class SettingsPage(Adw.PreferencesPage):
             if error:
                 _error_dialog(self.window, _("Update failed"), str(error) or repr(error))
             else:
-                _toast(self.window.toasts, _("Roblox updated, the old version is in backups/"))
+                _toast(self.window.toasts, _("Roblox updated, the old version is in backups/") if backup
+                       else _("Roblox installed"))
 
         self._in_thread(lambda: core.update_roblox(upload, progress), done)
 
@@ -505,31 +576,52 @@ class SettingsPage(Adw.PreferencesPage):
         dialog.set_response_appearance("logout", Adw.ResponseAppearance.DESTRUCTIVE)
 
         def response(_dialog, result):
-            if result == "logout":
-                core.logout()
-                _toast(self.window.toasts, _("Session deleted"))
+            # A running game would write its session back on the next cookie change.
+            if result != "logout" or not self.window.begin("signing out"):
+                return
+
+            def done(gone, error):
+                self.window.end()
+                if gone:
+                    _toast(self.window.toasts, _("Session deleted"))
+                else:
+                    _error_dialog(self.window, _("Could not sign out"),
+                                  str(error) if error else
+                                  _("The saved session is still there. Press Restart Darling in "
+                                    "Diagnostics and try again."))
+
+            self._in_thread(core.logout, done)
 
         dialog.connect("response", response)
         dialog.present(self.window)
 
     def rebuild(self):
+        if not self.window.begin("building"):
+            return
         _toast(self.window.toasts, _("Building the shim…"))
 
         def done(result, error):
+            self.window.end()
             ok, output = result if result else (False, str(error))
-            _toast(self.window.toasts, _("Shim built") if ok else _("Build failed, details in the terminal"))
-            if not ok:
-                print(output)
+            if ok:
+                _toast(self.window.toasts, _("Shim built"))
+            else:
+                _error_dialog(self.window, _("Could not build the shim"), output)
 
         self._in_thread(core.build_shim, done)
 
     def restart_darling(self):
-        if self.window.session:
-            _toast(self.window.toasts, _("Close Roblox first"))
+        if not self.window.begin("restarting"):
             return
-        core.restart_darling()
-        _toast(self.window.toasts, _("Darling stopped, it starts with the next game"))
-        GLib.timeout_add_seconds(2, lambda: self.window.play_page.refresh() and False)
+
+        def done(_result, error):
+            self.window.end()
+            if error:
+                _toast(self.window.toasts, _("Could not restart Darling: {error}", error=error))
+            else:
+                _toast(self.window.toasts, _("Darling stopped, it starts with the next game"))
+
+        self._in_thread(core.restart_darling, done)
 
 
 ABOUT = ("Mac O’ Blox runs the real Roblox client for macOS on Linux through Darling. "
@@ -614,17 +706,24 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.settings = core.load_settings()
         i18n.set_language(self.settings.get("language", "en"))
         self.session = None
+        # One long operation at a time: starting, updating, building,
+        # restarting Darling or signing out. They share the client and Darling.
+        self.busy = None
+        self.quit_when_idle = False  # the window was closed during an operation
         self.last_log = None
         # MACOBLOX_PAGE opens another tab first (for screenshots).
         self.build(os.environ.get("MACOBLOX_PAGE", "play"))
 
     def build(self, page):
         """(Re)create the interface, e.g. after the language changes."""
+        if getattr(self, "flags_page", None):
+            self.flags_page.flush()  # the new page reads the file
         self.toasts = Adw.ToastOverlay()
         self.stack = Adw.ViewStack()
         self.play_page = PlayPage(self)
         self.stack.add_titled_with_icon(self.play_page, "play", _("Play"), "media-playback-start-symbolic")
-        self.stack.add_titled_with_icon(FlagsPage(self), "flags", _("Fast flags"), "preferences-other-symbolic")
+        self.flags_page = FlagsPage(self)
+        self.stack.add_titled_with_icon(self.flags_page, "flags", _("Fast flags"), "preferences-other-symbolic")
         self.settings_page = SettingsPage(self)
         self.stack.add_titled_with_icon(self.settings_page, "settings", _("Settings"), "emblem-system-symbolic")
         self.stack.add_titled_with_icon(InfoPage(self), "info", _("Info"), "help-about-symbolic")
@@ -638,6 +737,24 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.toasts.set_child(self.stack)
         view.set_content(self.toasts)
         self.set_content(view)
+
+    def begin(self, what):
+        """Claim the launcher for one long operation; False, with a message,
+        while the game runs or another operation is under way."""
+        if self.session or self.busy:
+            _toast(self.toasts, _("Close Roblox first") if self.session else
+                   _("Please wait, the launcher is busy"))
+            return False
+        self.busy = what
+        self.play_page.refresh()
+        return True
+
+    def end(self):
+        self.busy = None
+        if self.quit_when_idle:
+            self.get_application().quit()
+            return
+        self.play_page.refresh()
 
     def set_setting(self, key, value):
         self.settings[key] = value
@@ -725,30 +842,31 @@ class LauncherWindow(Adw.ApplicationWindow):
         threading.Thread(target=run, daemon=True).start()
 
     def launch(self):
-        if self.session:
+        if not self.begin("starting"):
             return
-        self.play_page.play.set_sensitive(False)
-        self.play_page.play.set_label(_("Starting…"))
-        session = core.RobloxSession(self.settings)
+        self.flags_page.flush()
+        session = core.RobloxSession(dict(self.settings))
 
         def start():
             try:
-                session.start()
+                session.start()  # cleans up after itself when it fails
                 GLib.idle_add(self._started, session, None)
             except Exception as error:
-                session.finish()
                 GLib.idle_add(self._started, None, error)
 
         threading.Thread(target=start, daemon=True).start()
 
     def _started(self, session, error):
+        self.busy = None
+        self.quit_when_idle = False  # a game or an error to show: stay
         if error:
+            self.set_visible(True)
             self.play_page.refresh()
             _error_dialog(self, _("Could not start Roblox"), str(error) or repr(error))
             return
         self.session = session
         self.last_log = session.log_path
-        self.play_page.refresh(running=True)
+        self.play_page.refresh()
         # Hide once the game window has had time to appear.
         GLib.timeout_add_seconds(3, self._hide_while_playing)
         GLib.timeout_add(1000, self._watch)
@@ -761,17 +879,24 @@ class LauncherWindow(Adw.ApplicationWindow):
     def _watch(self):
         if not self.session:
             return False
-        status = self.session.poll()
+        try:
+            status = self.session.poll()
+        except Exception as error:  # an exception here would stop this timer for good
+            print("Watching the game failed:", error)
+            self.session.finish()
+            status = -1
         if status is None:
             return True
         self.session = None
         self.play_page.refresh()
-        if self.settings.get("show_launcher_after_exit", True):
+        failed = status not in (0, -1)
+        # A failure is always shown, even with the launcher set to stay closed.
+        if failed or self.settings.get("show_launcher_after_exit", True):
             self.set_visible(True)
             self.present()
         else:
             self.get_application().quit()
-        if status not in (0, -1):
+        if failed:
             if core.exit_reason(self.last_log) == "captcha":
                 self._captcha_dialog()
             else:
@@ -783,7 +908,10 @@ class LauncherWindow(Adw.ApplicationWindow):
 
     def open_last_log(self):
         if self.last_log:
-            Gio.AppInfo.launch_default_for_uri(self.last_log.as_uri(), None)
+            try:
+                Gio.AppInfo.launch_default_for_uri(self.last_log.as_uri(), None)
+            except GLib.Error as error:
+                _toast(self.toasts, str(error))
 
 
 class LauncherApp(Adw.Application):
@@ -807,9 +935,13 @@ class LauncherApp(Adw.Application):
             GLib.timeout_add(300, lambda: self.window.set_focus(None) and False)
 
     def _close(self, window):
-        if window.session:
-            # Closing during a game only hides the launcher.
+        window.flags_page.flush()
+        if window.session or window.busy:
+            # Closing during a game only hides the launcher. Closing during an
+            # update, build or start hides it until that is done: quitting
+            # would stop the work half way (a half unpacked client).
             window.set_visible(False)
+            window.quit_when_idle = window.busy is not None
             return True
         self.release()
         self.quit()
