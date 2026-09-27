@@ -22,6 +22,11 @@ MAINTAINER = "aubree.wtf"
 MAINTAINER_URL = "https://aubree.wtf"
 MAINTAINER_AVATAR = core.PROJECT / "branding" / "contributors" / "aubree.png"
 
+UI_CONTRIBUTOR = "TinyTosha"
+UI_CONTRIBUTOR_URL = "https://github.com/amethyst-bin"
+UI_CONTRIBUTOR_AVATAR = core.CACHE_DIR / "tinytosha-avatar.png"
+TINYTOSHA_AVATAR_URL = "https://avatars.githubusercontent.com/u/259899852"
+
 AVATAR = core.CACHE_DIR / "author-avatar.png"
 THUMBNAIL_API = ("https://thumbnails.roblox.com/v1/users/avatar-headshot"
                  f"?userIds={ROBLOX_ID}&size=150x150&format=Png&isCircular=false")
@@ -86,3 +91,23 @@ def avatar(settings, max_age=86400):
     except (OSError, ValueError, KeyError, IndexError):
         pass
     return AVATAR if AVATAR.exists() else None
+
+
+def tinytosha_avatar(max_age=86400):
+    """Path to the cached GitHub avatar for TinyTosha, refreshed once a day."""
+    try:
+        if time.time() - UI_CONTRIBUTOR_AVATAR.stat().st_mtime < max_age:
+            return UI_CONTRIBUTOR_AVATAR
+    except OSError:
+        pass
+    try:
+        req = urllib.request.Request(TINYTOSHA_AVATAR_URL, headers={"User-Agent": "MacOBlox"})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            image = response.read()
+        core.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        partial = UI_CONTRIBUTOR_AVATAR.with_suffix(".part")
+        partial.write_bytes(image)
+        partial.replace(UI_CONTRIBUTOR_AVATAR)
+    except (OSError, urllib.error.URLError):
+        pass
+    return UI_CONTRIBUTOR_AVATAR if UI_CONTRIBUTOR_AVATAR.exists() else None

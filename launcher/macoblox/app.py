@@ -18,8 +18,8 @@ APP_ID = "xyz.narez.MacOBlox"
 # Common fast flags. Roblox only honours flags on its client allowlist, so
 # some of these may have no effect in a given client version.
 PRESETS = [
-    {"title": "FPS limit", "subtitle": "DFIntTaskSchedulerTargetFps",
-     "flag": "DFIntTaskSchedulerTargetFps", "kind": "number", "default": 144, "min": 30, "max": 1000},
+    {"title": "FPS limit", "subtitle": "GlobalBasicSettings_13 / DFIntTaskSchedulerTargetFps",
+     "flag": "DFIntTaskSchedulerTargetFps", "kind": "fps", "default": 144, "min": 30, "max": 1000},
     {"title": "Graphics quality", "subtitle": "DFIntDebugFRMQualityLevelOverride, 1–21",
      "flag": "DFIntDebugFRMQualityLevelOverride", "kind": "number", "default": 10, "min": 1, "max": 21},
     {"title": "MSAA", "subtitle": "FIntDebugForceMSAASamples: 0, 1, 2, 4, 8",
@@ -28,6 +28,18 @@ PRESETS = [
      "flag": "FIntRenderShadowIntensity", "kind": "fixed", "value": 0},
     {"title": "No grass", "subtitle": "FIntFRMMinGrassDistance / FIntFRMMaxGrassDistance = 0",
      "flag": ["FIntFRMMinGrassDistance", "FIntFRMMaxGrassDistance"], "kind": "fixed", "value": 0},
+    {"title": "Disable post-processing", "subtitle": "FFlagDisablePostFx = True",
+     "flag": "FFlagDisablePostFx", "kind": "fixed", "value": True},
+    {"title": "Low quality terrain", "subtitle": "FIntTerrainArraySliceSize = 0",
+     "flag": "FIntTerrainArraySliceSize", "kind": "fixed", "value": 0},
+    {"title": "Disable global wind", "subtitle": "FFlagGlobalWindControl = False",
+     "flag": "FFlagGlobalWindControl", "kind": "fixed", "value": False},
+    {"title": "Force Voxel lighting", "subtitle": "DFFlagDebugRenderForceTechnologyVoxel = True",
+     "flag": "DFFlagDebugRenderForceTechnologyVoxel", "kind": "fixed", "value": True},
+    {"title": "Disable telemetry", "subtitle": "FFlagDebugDisableTelemetry = True",
+     "flag": "FFlagDebugDisableTelemetry", "kind": "fixed", "value": True},
+    {"title": "Texture quality override", "subtitle": "DFIntTextureQualityOverride: 0–3",
+     "flag": "DFIntTextureQualityOverride", "kind": "number", "default": 3, "min": 0, "max": 3},
 ]
 
 DNS_CHOICES = [
@@ -82,63 +94,74 @@ def _error_dialog(window, heading, details):
     dialog.present(window)
 
 
-class PlayPage(Gtk.Box):
+class PlayPage(Adw.Bin):
     def __init__(self, window):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        super().__init__()
         self.window = window
+        toolbar_view = Adw.ToolbarView()
+
         status = Adw.StatusPage()
         status.set_icon_name("macoblox")
         status.set_title("Mac O’ Blox")
-        status.set_vexpand(True)
         self.status = status
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
-                      halign=Gtk.Align.CENTER)
-        self.play = Gtk.Button(label=_("Play"))
-        self.play.add_css_class("suggested-action")
-        self.play.add_css_class("pill")
-        self.play.set_size_request(220, 52)
-        self.play.connect("clicked", lambda *_args: window.play_clicked())
-        box.append(self.play)
-
-        self.stop = Gtk.Button(label=_("Stop Roblox"))
-        self.stop.add_css_class("destructive-action")
-        self.stop.add_css_class("pill")
-        self.stop.set_visible(False)
-        self.stop.connect("clicked", lambda *_args: window.stop())
-        box.append(self.stop)
-
-        self.studio = Gtk.Button(label=_("Roblox Studio"))
-        self.studio.add_css_class("pill")
-        self.studio.set_size_request(220, -1)
-        self.studio.connect("clicked", lambda *_args: window.studio_clicked())
-        # Studio needs Wine, which the Flatpak does not have yet.
-        self.studio.set_visible(not os.path.exists("/.flatpak-info"))
-        box.append(self.studio)
-        self.studio_progress = Gtk.ProgressBar(show_text=True, visible=False)
-        box.append(self.studio_progress)
+        center_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                             halign=Gtk.Align.CENTER)
 
         self.log_button = Gtk.Button(label=_("Open last log"))
         self.log_button.add_css_class("flat")
         self.log_button.set_visible(False)
         self.log_button.connect("clicked", lambda *_args: window.open_last_log())
-        box.append(self.log_button)
+        center_box.append(self.log_button)
 
-        links = Gtk.Box(spacing=6, halign=Gtk.Align.CENTER, margin_top=18)
+        links = Gtk.Box(spacing=6, halign=Gtk.Align.CENTER, margin_top=14)
         for title, icon, uri in _links():
             button = Gtk.Button(icon_name=icon, tooltip_text=title)
             button.add_css_class("flat")
             button.add_css_class("circular")
             button.connect("clicked", lambda *_args, u=uri: _open_uri(window, u))
             links.append(button)
-        box.append(links)
+        center_box.append(links)
 
-        status.set_child(box)
-        self.append(status)
-        version = Gtk.Label(label=f"Mac O’ Blox {__version__}", margin_bottom=10)
+        status.set_child(center_box)
+        toolbar_view.set_content(status)
+
+        action_bar = Gtk.ActionBar()
+
+        version = Gtk.Label(label=f"Mac O’ Blox {__version__}")
         version.add_css_class("dim-label")
         version.add_css_class("caption")
-        self.append(version)
+        action_bar.pack_start(version)
+
+        self.studio_progress = Gtk.ProgressBar(show_text=True, visible=False)
+        self.studio_progress.set_size_request(160, -1)
+        action_bar.pack_start(self.studio_progress)
+
+        self.play = Gtk.Button(label=_("Play"))
+        self.play.add_css_class("suggested-action")
+        self.play.add_css_class("pill")
+        self.play.set_size_request(130, -1)
+        self.play.connect("clicked", lambda *_args: window.play_clicked())
+        action_bar.pack_end(self.play)
+
+        self.stop = Gtk.Button(label=_("Stop Roblox"))
+        self.stop.add_css_class("destructive-action")
+        self.stop.add_css_class("pill")
+        self.stop.set_size_request(130, -1)
+        self.stop.set_visible(False)
+        self.stop.connect("clicked", lambda *_args: window.stop())
+        action_bar.pack_end(self.stop)
+
+        self.studio = Gtk.Button(label=_("Roblox Studio"))
+        self.studio.add_css_class("pill")
+        self.studio.set_size_request(130, -1)
+        self.studio.connect("clicked", lambda *_args: window.studio_clicked())
+        # Studio needs Wine, which the Flatpak does not have yet.
+        self.studio.set_visible(not os.path.exists("/.flatpak-info"))
+        action_bar.pack_end(self.studio)
+
+        toolbar_view.add_bottom_bar(action_bar)
+        self.set_child(toolbar_view)
         self.refresh()
 
     def refresh(self):
@@ -207,6 +230,43 @@ class FlagsPage(Adw.PreferencesPage):
         names = preset["flag"] if isinstance(preset["flag"], list) else [preset["flag"]]
         self.preset_flags.update(names)
         enabled = all(name in self.flags for name in names)
+        if preset["kind"] == "fps":
+            row = Adw.SpinRow.new_with_range(preset["min"], preset["max"], 1)
+            row.set_title(_(preset["title"]))
+            row.set_subtitle(preset["subtitle"])
+            cap = core.load_framerate_cap(preset["default"])
+            current = self.flags.get(names[0], cap)
+            row.set_value(float(current) if str(current).lstrip("-").isdigit() else preset["default"])
+            enabled = bool(names[0] in self.flags or cap > 0)
+            switch = Gtk.Switch(active=enabled, valign=Gtk.Align.CENTER)
+            row.add_suffix(switch)
+
+            def apply(*_args):
+                if switch.get_active():
+                    val = int(row.get_value())
+                    core.save_framerate_cap(val)
+                    for name in names:
+                        self.flags[name] = val
+                else:
+                    core.save_framerate_cap(-1)
+                    for name in names:
+                        self.flags.pop(name, None)
+                self._save()
+
+            switch.connect("notify::active", apply)
+            row.connect("notify::value", lambda *_args: switch.get_active() and apply())
+
+            def set_fps(value):
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    return False
+                row.set_value(value)
+                switch.set_active(True)
+                apply()
+                return True
+
+            for name in names:
+                self.preset_setters[name] = set_fps
+            return row
         if preset["kind"] == "number":
             row = Adw.SpinRow.new_with_range(preset["min"], preset["max"], 1)
             row.set_title(_(preset["title"]))
@@ -373,11 +433,38 @@ class FlagsPage(Adw.PreferencesPage):
             self._save_now()
 
 
-class SettingsPage(Adw.PreferencesPage):
+class SettingsPage(Adw.Bin):
     def __init__(self, window):
-        super().__init__(title=_("Settings"), icon_name="emblem-system-symbolic")
+        super().__init__()
         self.window = window
         settings = window.settings
+
+        toolbar_view = Adw.ToolbarView()
+        self.stack = Adw.ViewStack()
+
+        # 1. Environment page (Interface, Game, DNS, Diagnostics)
+        self.env_page = Adw.PreferencesPage()
+
+        launcher_group = Adw.PreferencesGroup(title="Mac O’ Blox")
+        self.launcher_version_row = Adw.ActionRow(
+            title=_("Launcher version"),
+            subtitle=f"v{__version__}"
+        )
+        self.check_launcher_btn = Gtk.Button(label=_("Check for updates"), valign=Gtk.Align.CENTER)
+        self._launcher_update_handler = self.check_launcher_btn.connect(
+            "clicked", lambda *_args: self.check_launcher_update()
+        )
+        self.launcher_version_row.add_suffix(self.check_launcher_btn)
+        launcher_group.add(self.launcher_version_row)
+
+        force_update = _button_row(_("Force update"))
+        force_update.connect("activated", lambda *_args: self.force_update_launcher())
+        launcher_group.add(force_update)
+
+        self.launcher_progress = Gtk.ProgressBar(show_text=True, margin_top=6, margin_bottom=6,
+                                                 margin_start=12, margin_end=12, visible=False)
+        launcher_group.add(Gtk.ListBoxRow(activatable=False, selectable=False, child=self.launcher_progress))
+        self.env_page.add(launcher_group)
 
         interface = Adw.PreferencesGroup(title=_("Interface"))
         codes = list(i18n.LANGUAGES)
@@ -387,7 +474,7 @@ class SettingsPage(Adw.PreferencesPage):
         language.connect("notify::selected", lambda row, _pspec: window.set_language(
             codes[row.get_selected()]))
         interface.add(language)
-        self.add(interface)
+        self.env_page.add(interface)
 
         game = Adw.PreferencesGroup(title=_("Game"))
         sensitivity = Adw.SpinRow.new_with_range(0.1, 5.0, 0.05)
@@ -409,7 +496,7 @@ class SettingsPage(Adw.PreferencesPage):
         reopen.connect("notify::active", lambda row, _pspec: window.set_setting(
             "show_launcher_after_exit", row.get_active()))
         game.add(reopen)
-        self.add(game)
+        self.env_page.add(game)
 
         dns_group = Adw.PreferencesGroup(
             title=_("DNS for Roblox"),
@@ -446,27 +533,7 @@ class SettingsPage(Adw.PreferencesPage):
         custom.connect("apply", custom_applied)
         dns_group.add(server)
         dns_group.add(custom)
-        self.add(dns_group)
-
-        roblox = Adw.PreferencesGroup(title="Roblox")
-        self.version_row = Adw.ActionRow(title=_("Installed version"),
-                                         subtitle=core.installed_version() or _("not found"))
-        self.update_button = Gtk.Button(label=_("Check for updates"), valign=Gtk.Align.CENTER)
-        self._update_handler = self.update_button.connect("clicked", lambda *_args: self.check_updates())
-        self.version_row.add_suffix(self.update_button)
-        roblox.add(self.version_row)
-        self.progress = Gtk.ProgressBar(show_text=True, margin_top=6, margin_bottom=6,
-                                        margin_start=12, margin_end=12, visible=False)
-        progress_row = Gtk.ListBoxRow(activatable=False, selectable=False, child=self.progress)
-        roblox.add(progress_row)
-        self.add(roblox)
-
-        account = Adw.PreferencesGroup(title=_("Account"))
-        logout = _button_row(_("Sign out"))
-        logout.add_css_class("destructive-action")
-        logout.connect("activated", lambda *_args: self.logout())
-        account.add(logout)
-        self.add(account)
+        self.env_page.add(dns_group)
 
         diagnostics = Adw.PreferencesGroup(
             title=_("Diagnostics"),
@@ -490,7 +557,55 @@ class SettingsPage(Adw.PreferencesPage):
         restart = _button_row(_("Restart Darling"))
         restart.connect("activated", lambda *_args: self.restart_darling())
         diagnostics.add(restart)
-        self.add(diagnostics)
+        self.env_page.add(diagnostics)
+
+        self.stack.add_titled_with_icon(self.env_page, "env", _("Environment"), "preferences-system-symbolic")
+
+        # 2. Roblox page (Download, updates, version, account)
+        self.roblox_page = Adw.PreferencesPage()
+
+        roblox = Adw.PreferencesGroup(title="Roblox")
+        self.version_row = Adw.ActionRow(title=_("Installed version"),
+                                         subtitle=core.installed_version() or _("not found"))
+        self.update_button = Gtk.Button(label=_("Check for updates"), valign=Gtk.Align.CENTER)
+        self._update_handler = self.update_button.connect("clicked", lambda *_args: self.check_updates())
+        self.version_row.add_suffix(self.update_button)
+        roblox.add(self.version_row)
+        self.progress = Gtk.ProgressBar(show_text=True, margin_top=6, margin_bottom=6,
+                                        margin_start=12, margin_end=12, visible=False)
+        progress_row = Gtk.ListBoxRow(activatable=False, selectable=False, child=self.progress)
+        roblox.add(progress_row)
+        self.roblox_page.add(roblox)
+
+        account = Adw.PreferencesGroup(title=_("Account"))
+        logout = _button_row(_("Sign out"))
+        logout.add_css_class("destructive-action")
+        logout.connect("activated", lambda *_args: self.logout())
+        account.add(logout)
+        self.roblox_page.add(account)
+
+        self.stack.add_titled_with_icon(self.roblox_page, "roblox", "Roblox", "application-x-executable-symbolic")
+
+        # 3. Fast flags page
+        self.flags_page = FlagsPage(window)
+        self.stack.add_titled_with_icon(self.flags_page, "flags", _("Fast flags"), "preferences-other-symbolic")
+
+        top_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        top_box.set_margin_top(10)
+        top_box.set_margin_bottom(10)
+        switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
+        switcher.set_halign(Gtk.Align.CENTER)
+        top_box.append(switcher)
+        toolbar_view.add_top_bar(top_box)
+        toolbar_view.set_content(self.stack)
+
+        self.set_child(toolbar_view)
+
+    def set_tab(self, tab):
+        self.stack.set_visible_child_name(tab)
+
+    def flush(self):
+        self.flags_page.flush()
 
     def open_logs(self):
         try:
@@ -512,6 +627,58 @@ class SettingsPage(Adw.PreferencesPage):
         self.update_button.set_label(label)
         self.update_button.disconnect(self._update_handler)
         self._update_handler = self.update_button.connect("clicked", lambda *_args: action())
+
+    def check_launcher_update(self):
+        self.check_launcher_btn.set_sensitive(False)
+        self.check_launcher_btn.set_label(_("Checking…"))
+
+        def done(result, error):
+            self.check_launcher_btn.set_sensitive(True)
+            if error:
+                self.check_launcher_btn.set_label(_("Check for updates"))
+                _toast(self.window.toasts, _("Could not check: {error}", error=error))
+                return
+            has_update, tag, html_url = result
+            if has_update:
+                self.launcher_version_row.set_subtitle(_("Update {version} available", version=tag))
+                self.check_launcher_btn.set_label(_("Update to {version}", version=tag))
+                self.check_launcher_btn.disconnect(self._launcher_update_handler)
+                self._launcher_update_handler = self.check_launcher_btn.connect(
+                    "clicked", lambda *_args: self.force_update_launcher()
+                )
+                _toast(self.window.toasts, _("Update {version} available", version=tag))
+            else:
+                self.check_launcher_btn.set_label(_("Check for updates"))
+                _toast(self.window.toasts, _("Mac O’ Blox is up to date"))
+
+        self._in_thread(core.check_launcher_update, done)
+
+    def force_update_launcher(self):
+        if not self.window.begin("updating_launcher"):
+            return
+        self.check_launcher_btn.set_sensitive(False)
+        self.launcher_progress.set_visible(True)
+        self.launcher_progress.set_fraction(0.1)
+        self.launcher_progress.set_text(_("Updating…"))
+
+        def progress(fraction, text):
+            GLib.idle_add(self.launcher_progress.set_fraction, fraction)
+            GLib.idle_add(self.launcher_progress.set_text, text)
+
+        def done(result, error):
+            self.window.end()
+            self.check_launcher_btn.set_sensitive(True)
+            self.launcher_progress.set_visible(False)
+            if error:
+                _error_dialog(self.window, _("Update failed"), str(error) or repr(error))
+                return
+            ok, msg = result if result else (False, "")
+            if ok:
+                _toast(self.window.toasts, msg)
+            else:
+                _open_uri(self.window, msg)
+
+        self._in_thread(lambda: core.update_launcher(progress), done)
 
     def check_updates(self, install=False):
         """Looks for a newer client; with install=True also installs it
@@ -677,6 +844,15 @@ class InfoPage(Adw.PreferencesPage):
         maintainer.add_suffix(Gtk.Image(icon_name="adw-external-link-symbolic"))
         maintainer.connect("activated", lambda *_args: _open_uri(window, author.MAINTAINER_URL))
         made_by.add(maintainer)
+
+        self.ui_contributor_avatar = Adw.Avatar(size=48, text=author.UI_CONTRIBUTOR, show_initials=True)
+        ui_contributor = Adw.ActionRow(title=author.UI_CONTRIBUTOR, activatable=True,
+                                       subtitle="Modern UI (vibecoded too)")
+        ui_contributor.add_prefix(self.ui_contributor_avatar)
+        ui_contributor.add_suffix(Gtk.Image(icon_name="adw-external-link-symbolic"))
+        ui_contributor.connect("activated", lambda *_args: _open_uri(window, author.UI_CONTRIBUTOR_URL))
+        made_by.add(ui_contributor)
+
         claude = Adw.ActionRow(title=_("Made with Claude Opus 5.5"), activatable=True,
                                subtitle=_("Anthropic's AI wrote the code together with the authors"))
         claude.add_suffix(Gtk.Image(icon_name="adw-external-link-symbolic"))
@@ -687,6 +863,8 @@ class InfoPage(Adw.PreferencesPage):
         settings = dict(window.settings)
         threading.Thread(target=lambda: GLib.idle_add(self._show_avatar, author.avatar(settings)),
                          daemon=True).start()
+        threading.Thread(target=lambda: GLib.idle_add(self._show_tinytosha_avatar, author.tinytosha_avatar()),
+                         daemon=True).start()
 
     def _show_avatar(self, path):
         if path:
@@ -696,14 +874,20 @@ class InfoPage(Adw.PreferencesPage):
                 pass
         return False
 
+    def _show_tinytosha_avatar(self, path):
+        if path:
+            try:
+                self.ui_contributor_avatar.set_custom_image(Gdk.Texture.new_from_filename(str(path)))
+            except GLib.Error:
+                pass
+        return False
+
 
 class LauncherWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Mac O’ Blox")
-        self.set_default_size(560, 680)
-        # A fixed size makes tiling compositors (Hyprland, Sway) float the
-        # launcher like a dialog instead of tiling it.
-        self.set_resizable(False)
+        self.set_default_size(760, 580)
+        self.set_resizable(True)
         self.settings = core.load_settings()
         i18n.set_language(self.settings.get("language", "en"))
         self.session = None
@@ -714,30 +898,95 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.last_log = None
         # MACOBLOX_PAGE opens another tab first (for screenshots).
         self.build(os.environ.get("MACOBLOX_PAGE", "play"))
+        threading.Thread(target=self._check_startup_update, daemon=True).start()
 
     def build(self, page):
         """(Re)create the interface, e.g. after the language changes."""
-        if getattr(self, "flags_page", None):
-            self.flags_page.flush()  # the new page reads the file
+        if getattr(self, "settings_page", None):
+            self.settings_page.flush()  # the new page reads the file
         self.toasts = Adw.ToastOverlay()
         self.stack = Adw.ViewStack()
         self.play_page = PlayPage(self)
         self.stack.add_titled_with_icon(self.play_page, "play", _("Play"), "media-playback-start-symbolic")
-        self.flags_page = FlagsPage(self)
-        self.stack.add_titled_with_icon(self.flags_page, "flags", _("Fast flags"), "preferences-other-symbolic")
         self.settings_page = SettingsPage(self)
         self.stack.add_titled_with_icon(self.settings_page, "settings", _("Settings"), "emblem-system-symbolic")
-        self.stack.add_titled_with_icon(InfoPage(self), "info", _("Info"), "help-about-symbolic")
-        self.stack.set_visible_child_name(page)
+        self.info_page = InfoPage(self)
+        self.stack.add_titled_with_icon(self.info_page, "info", _("Info"), "help-about-symbolic")
+        self.flags_page = self.settings_page.flags_page
 
+        if page in ("flags", "env", "roblox"):
+            self.stack.set_visible_child_name("settings")
+            self.settings_page.set_tab(page)
+        else:
+            self.stack.set_visible_child_name(page)
+
+        # Official Libadwaita Split View layout
+        self.split = Adw.OverlaySplitView()
+        self.split.set_min_sidebar_width(200)
+        self.split.set_max_sidebar_width(260)
+        self.split.set_sidebar_width_fraction(0.28)
+        self.split.set_show_sidebar(self.settings.get("show_sidebar", True))
+
+        # Sidebar with native ViewSwitcherSidebar
+        sidebar_toolbar = Adw.ToolbarView()
+        sidebar_header = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
+        sidebar_header.set_title_widget(Gtk.Label(label="Mac O’ Blox", css_classes=["heading"]))
+        sidebar_toolbar.add_top_bar(sidebar_header)
+
+        switcher_sidebar = Adw.ViewSwitcherSidebar()
+        switcher_sidebar.set_stack(self.stack)
+        sidebar_toolbar.set_content(switcher_sidebar)
+        self.split.set_sidebar(sidebar_toolbar)
+
+        # Content area
+        content_view = Adw.ToolbarView()
         header = Adw.HeaderBar()
-        switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
-        header.set_title_widget(switcher)
-        view = Adw.ToolbarView()
-        view.add_top_bar(header)
+
+        sidebar_toggle = Gtk.Button(icon_name="sidebar-show-symbolic")
+        sidebar_toggle.add_css_class("flat")
+        sidebar_toggle.set_tooltip_text(_("Toggle sidebar"))
+        sidebar_toggle.connect("clicked", lambda *_args: self.toggle_sidebar())
+        header.pack_start(sidebar_toggle)
+
+        content_view.add_top_bar(header)
         self.toasts.set_child(self.stack)
-        view.set_content(self.toasts)
-        self.set_content(view)
+        content_view.set_content(self.toasts)
+        content_view.set_hexpand(True)
+        content_view.set_vexpand(True)
+        self.split.set_content(content_view)
+
+        self.set_content(self.split)
+
+    def toggle_sidebar(self):
+        show = not self.split.get_show_sidebar()
+        self.split.set_show_sidebar(show)
+        self.set_setting("show_sidebar", show)
+
+    def _check_startup_update(self):
+        try:
+            has_update, tag, html_url = core.check_launcher_update()
+            if has_update:
+                GLib.idle_add(self._show_launcher_update_dialog, tag)
+        except Exception:
+            pass
+
+    def _show_launcher_update_dialog(self, tag):
+        dialog = Adw.AlertDialog(
+            heading=_("Update available"),
+            body=_("A new version of Mac O’ Blox ({version}) is available. Update now?", version=tag)
+        )
+        dialog.add_response("later", _("Later"))
+        dialog.add_response("update", _("Update"))
+        dialog.set_response_appearance("update", Adw.ResponseAppearance.SUGGESTED)
+
+        def response(_dialog, result):
+            if result == "update":
+                self.stack.set_visible_child_name("settings")
+                self.settings_page.set_tab("env")
+                self.settings_page.force_update_launcher()
+
+        dialog.connect("response", response)
+        dialog.present(self)
 
     def begin(self, what):
         """Claim the launcher for one long operation; False, with a message,
@@ -784,6 +1033,7 @@ class LauncherWindow(Adw.ApplicationWindow):
             self.launch()
         else:
             self.stack.set_visible_child_name("settings")
+            self.settings_page.set_tab("roblox")
             self.settings_page.check_updates(install=True)
 
     def studio_clicked(self):
@@ -845,7 +1095,7 @@ class LauncherWindow(Adw.ApplicationWindow):
     def launch(self):
         if not self.begin("starting"):
             return
-        self.flags_page.flush()
+        self.settings_page.flush()
         session = core.RobloxSession(dict(self.settings))
 
         def start():
@@ -936,7 +1186,7 @@ class LauncherApp(Adw.Application):
             GLib.timeout_add(300, lambda: self.window.set_focus(None) and False)
 
     def _close(self, window):
-        window.flags_page.flush()
+        window.settings_page.flush()
         if window.session or window.busy:
             # Closing during a game only hides the launcher. Closing during an
             # update, build or start hides it until that is done: quitting
