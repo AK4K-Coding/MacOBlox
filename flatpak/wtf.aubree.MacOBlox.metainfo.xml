@@ -69,7 +69,7 @@
   <releases>
     <release version="0.15" date="2026-09-27">
       <description>
-        <p>Signing in with a password and other embedded pages open in the launcher's own browser window. New app ID wtf.aubree.MacOBlox. Fixes for a Fedora KDE crash loop and for Darling's thread stacks.</p>
+        <p>Signing in with a password and other embedded pages open in the launcher's own browser window. Microphone for voice chat. New app ID wtf.aubree.MacOBlox. Fixes for a Fedora KDE crash loop, for Darling's thread stacks, and for the Flatpak failing with "Cannot determine your user name".</p>
       </description>
     </release>
     <release version="0.14" date="2026-09-26">
