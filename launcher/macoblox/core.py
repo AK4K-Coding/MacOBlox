@@ -95,6 +95,8 @@ DEFAULT_SETTINGS = {
     "mod_cursor_type": "default",
     "mod_custom_cursor": "",
     "mod_custom_font": "",
+    "mod_emoji_type": "twemoji",
+    "mod_custom_emoji": "",
     "enable_custom_mods": True,
 }
 

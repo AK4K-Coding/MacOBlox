@@ -1030,7 +1030,7 @@ class InfoPage(Adw.PreferencesPage):
 
         self.ui_contributor_avatar = Adw.Avatar(size=48, text=author.UI_CONTRIBUTOR, show_initials=True)
         ui_contributor = Adw.ActionRow(title=author.UI_CONTRIBUTOR, activatable=True,
-                                       subtitle="Modern UI (vibecoded too)")
+                                       subtitle=_("Better UI, Mods"))
         ui_contributor.add_prefix(self.ui_contributor_avatar)
         ui_contributor.add_suffix(Gtk.Image(icon_name="adw-external-link-symbolic"))
         ui_contributor.connect("activated", lambda *_args: _open_uri(window, author.UI_CONTRIBUTOR_URL))
@@ -1173,7 +1173,42 @@ class ModsPage(Adw.Bin):
         fonts_group.add(self.font_row)
         page.add(fonts_group)
 
-        # 4. User modifications
+        # 4. Emoji style
+        emoji_group = Adw.PreferencesGroup(title=_("Emoji style"))
+
+        emoji_choices = [
+            ("twemoji", _("Twemoji (Roblox)")),
+            ("noto", "Noto (Google)"),
+            ("blubmoji", "Blubmoji (Blob)"),
+            ("apple", "Apple"),
+            ("custom", _("Custom emoji")),
+        ]
+        self._emoji_codes = [c[0] for c in emoji_choices]
+        cur_emoji = settings.get("mod_emoji_type", "twemoji")
+        cur_emoji_idx = self._emoji_codes.index(cur_emoji) if cur_emoji in self._emoji_codes else 0
+
+        self.emoji_row = Adw.ComboRow(
+            title=_("Emoji font"),
+            subtitle=_("Replaces in-game emoji font (TwemojiMozilla.ttf)"),
+            model=Gtk.StringList.new([c[1] for c in emoji_choices]),
+            selected=cur_emoji_idx,
+        )
+        self.emoji_row.connect("notify::selected", self._on_emoji_selected)
+        emoji_group.add(self.emoji_row)
+
+        self.custom_emoji_row = Adw.ActionRow(
+            title=_("Custom emoji font file"),
+            subtitle=settings.get("mod_custom_emoji") or _("No file chosen"),
+            visible=(cur_emoji == "custom"),
+        )
+        custom_emoji_btn = Gtk.Button(label=_("Choose…"), valign=Gtk.Align.CENTER)
+        custom_emoji_btn.connect("clicked", lambda *_args: self._choose_custom_emoji())
+        self.custom_emoji_row.add_suffix(custom_emoji_btn)
+        emoji_group.add(self.custom_emoji_row)
+
+        page.add(emoji_group)
+
+        # 5. User modifications
         mods_group = Adw.PreferencesGroup(title=_("User modifications"))
 
         custom_mods_switch = Adw.SwitchRow(
@@ -1221,6 +1256,46 @@ class ModsPage(Adw.Bin):
         code = self._cursor_codes[row.get_selected()]
         self.window.set_setting("mod_cursor_type", code)
         self.custom_cursor_row.set_visible(code == "custom")
+
+    def _on_emoji_selected(self, row, _pspec):
+        code = self._emoji_codes[row.get_selected()]
+        self.window.set_setting("mod_emoji_type", code)
+        self.custom_emoji_row.set_visible(code == "custom")
+        if code in mods.EMOJI_URLS:
+            dest = mods.EMOJI_CACHE_DIR / f"{code}.ttf"
+            if not dest.is_file() or dest.stat().st_size < 500000:
+                _toast(self.window.toasts, _("Downloading {name} emoji font…", name=code.capitalize()))
+
+                def dl():
+                    res = mods.download_emoji_font(code)
+                    if res:
+                        GLib.idle_add(lambda: _toast(self.window.toasts, _("{name} emoji font downloaded", name=code.capitalize())))
+                threading.Thread(target=dl, daemon=True).start()
+
+    def _choose_custom_emoji(self):
+        dialog = Gtk.FileChooserNative.new(
+            _("Select custom emoji font (.ttf)"),
+            self.window,
+            Gtk.FileChooserAction.OPEN,
+            _("Select"),
+            _("Cancel"),
+        )
+        f = Gtk.FileFilter()
+        f.set_name("Font files (*.ttf)")
+        f.add_pattern("*.ttf")
+        dialog.add_filter(f)
+
+        def on_response(d, res):
+            if res == Gtk.ResponseType.ACCEPT:
+                file = d.get_file()
+                if file:
+                    path = file.get_path()
+                    self.window.set_setting("mod_custom_emoji", path)
+                    self.custom_emoji_row.set_subtitle(path)
+            d.destroy()
+
+        dialog.connect("response", on_response)
+        dialog.show()
 
     def _choose_custom_death_sound(self):
         dialog = Gtk.FileChooserNative.new(
