@@ -61,7 +61,6 @@ CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "ma
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 
 DARLING_HOME = DARLING_PREFIX / "Users" / os.environ.get("USER", "user")
-GLOBAL_BASIC_SETTINGS = DARLING_HOME / "Library" / "Roblox" / "GlobalBasicSettings_13.xml"
 SESSION_FILES = [
     DARLING_HOME / "Library" / "MacOBlox" / "Cookies.plist",
     DARLING_HOME / "Library" / "MacOBlox" / "Keychain",
@@ -86,6 +85,7 @@ DEFAULT_SETTINGS = {
     "trace_keys": False,
     "keep_logs": 30,
     "show_sidebar": True,
+    "framerate_cap": 0,
 }
 
 # Settings -> environment variables understood by the shim.
@@ -169,44 +169,6 @@ def format_flag_value(value):
     return str(value)
 
 
-def load_framerate_cap(default=144):
-    """Load FramerateCap from GlobalBasicSettings_13.xml."""
-    try:
-        text = GLOBAL_BASIC_SETTINGS.read_text(encoding="utf-8")
-        m = re.search(r'<int name="FramerateCap">(-?\d+)</int>', text)
-        if m:
-            val = int(m.group(1))
-            return val if val > 0 else default
-    except (OSError, ValueError):
-        pass
-    return default
-
-
-def save_framerate_cap(fps):
-    """Write FramerateCap to GlobalBasicSettings_13.xml for native FPS uncap."""
-    try:
-        GLOBAL_BASIC_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
-        if GLOBAL_BASIC_SETTINGS.exists():
-            text = GLOBAL_BASIC_SETTINGS.read_text(encoding="utf-8")
-            if '<int name="FramerateCap">' in text:
-                text = re.sub(r'<int name="FramerateCap">-?\d+</int>', f'<int name="FramerateCap">{fps}</int>', text)
-            else:
-                text = text.replace("</Properties>", f'\t\t\t<int name="FramerateCap">{fps}</int>\n\t\t</Properties>')
-        else:
-            text = (
-                '<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" version="4">\n'
-                '\t<Item class="UserGameSettings">\n'
-                '\t\t<Properties>\n'
-                f'\t\t\t<int name="FramerateCap">{fps}</int>\n'
-                '\t\t</Properties>\n'
-                '\t</Item>\n'
-                '</roblox>\n'
-            )
-        _write_atomically(GLOBAL_BASIC_SETTINGS, text)
-    except OSError as error:
-        print("Could not save FramerateCap to GlobalBasicSettings_13:", error)
-
-
 # ------------------------------------------------------------------ versions
 
 def installed_version():
@@ -226,6 +188,8 @@ def latest_version():
     return data["version"], data["clientVersionUpload"]
 
 
+REPO_URL = "https://github.com/aubree-lat/MacOBlox.git"
+RELEASES_URL = "https://github.com/aubree-lat/MacOBlox/releases/latest"
 LAUNCHER_RELEASE_URL = "https://api.github.com/repos/aubree-lat/MacOBlox/releases/latest"
 
 
@@ -235,36 +199,40 @@ def parse_version_tuple(ver):
 
 def check_launcher_update():
     """Checks GitHub for a newer release of Mac O’ Blox.
-    Returns (has_update, latest_version_string, release_url)."""
+    Returns (has_update, latest_version_string, release_url); raises when
+    GitHub cannot be reached, so a failed check is not reported as up to date."""
     req = urllib.request.Request(LAUNCHER_RELEASE_URL, headers={"User-Agent": "MacOBlox"})
-    try:
-        with urllib.request.urlopen(req, timeout=6) as response:
-            data = json.loads(response.read().decode())
-        tag = data.get("tag_name", "").lstrip("v")
-        html_url = data.get("html_url", "https://github.com/aubree-lat/MacOBlox/releases")
-        has_update = parse_version_tuple(tag) > parse_version_tuple(__version__)
-        return has_update, tag, html_url
-    except Exception as error:
-        return False, None, str(error)
+    with urllib.request.urlopen(req, timeout=6) as response:
+        data = json.loads(response.read().decode())
+    tag = str(data.get("tag_name") or "").lstrip("v")
+    html_url = data.get("html_url") or RELEASES_URL
+    has_update = bool(tag) and parse_version_tuple(tag) > parse_version_tuple(__version__)
+    return has_update, tag, html_url
+
+
+def _git(*args):
+    return subprocess.run(["git", "-C", str(PROJECT), *args], capture_output=True, text=True)
 
 
 def update_launcher(progress=None):
-    """Updates Mac O’ Blox: pulls latest commits if git repo, rebuilds shim,
-    and runs launcher/install.sh."""
+    """Updates Mac O’ Blox the way install.sh does: pulls the checkout
+    (fast-forward only, so a failed update never leaves a half merge),
+    rebuilds the shim and reinstalls the menu entries. Returns (True,
+    message), or (False, release page) when this is not a git checkout
+    (Flatpak, packages)."""
+    if not (PROJECT / ".git").is_dir():
+        return False, RELEASES_URL
     if progress:
         progress(0.2, _("Pulling latest version…"))
-
-    is_git = (PROJECT / ".git").is_dir()
-    if is_git:
-        proc = subprocess.run(["git", "pull", "--ff-only"], cwd=str(PROJECT),
-                              capture_output=True, text=True)
-        if proc.returncode != 0:
-            proc = subprocess.run(["git", "pull"], cwd=str(PROJECT),
-                                  capture_output=True, text=True)
-            if proc.returncode != 0:
-                raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
-    else:
-        return False, "https://github.com/aubree-lat/MacOBlox/releases/latest"
+    # Checkouts from before the move to this fork still point at the original
+    # repository, which does not have its fixes (install.sh does the same).
+    origin = _git("remote", "get-url", "origin").stdout.strip()
+    if origin in ("https://github.com/narezy/MacOBlox", "https://github.com/narezy/MacOBlox.git"):
+        _git("remote", "set-url", "origin", REPO_URL)
+    pull = _git("pull", "--ff-only")
+    if pull.returncode != 0:
+        raise RuntimeError(_("Could not update the files in {path}:\n{output}",
+                             path=PROJECT, output=(pull.stderr or pull.stdout).strip()))
 
     if progress:
         progress(0.6, _("Building shim…"))
@@ -276,12 +244,13 @@ def update_launcher(progress=None):
         progress(0.9, _("Updating launcher shortcuts…"))
     install_script = PROJECT / "launcher" / "install.sh"
     if install_script.exists():
-        subprocess.run([str(install_script)], cwd=str(PROJECT), check=True)
+        subprocess.run([str(install_script)], cwd=str(PROJECT), check=True,
+                       capture_output=True)
 
     if progress:
         progress(1.0, _("Mac O’ Blox updated successfully"))
-
-    return True, _("Mac O’ Blox updated successfully")
+    # This process keeps running the code it started with.
+    return True, _("Mac O’ Blox updated. Restart it to use the new version.")
 
 
 def update_roblox(upload, progress=None):
@@ -877,6 +846,31 @@ def icon_argb_file():
 LAUNCH_SCRIPT = r'''
 project=$1 shim_dir=$2; shift 2
 for kv in "$@"; do export "$kv"; done
+# Roblox's own frame rate limit (FramerateCap, its Maximum Frame Rate
+# setting), from the launcher's FPS limit. Set here, inside Darling, right
+# before the game starts: Roblox rewrites the file when it quits, and a file
+# in the prefix replaced from the host is not always seen by a running
+# Darling. Bash only (3.2), which splits ${var/a/b} at a "/" even inside
+# quotes, so the patterns come from variables.
+case ${MACOBLOX_FRAMERATE_CAP:-} in
+  '' | *[!0-9]*) ;;
+  *)
+    cap_file="$HOME/Library/Roblox/GlobalBasicSettings_13.xml"
+    if [ -f "$cap_file" ]; then
+      content=$(<"$cap_file")
+      wanted="<int name=\"FramerateCap\">$MACOBLOX_FRAMERATE_CAP</int>"
+      pattern='<int name="FramerateCap">-?[0-9]+</int>'
+      if [[ $content =~ $pattern ]]; then
+        old=${BASH_REMATCH[0]}
+        content=${content/$old/$wanted}
+      else
+        close='</Properties>'
+        insert=$'\t'"$wanted"$'\n\t\t</Properties>'
+        content=${content/$close/$insert}
+      fi
+      printf '%s\n' "$content" > "$cap_file"
+    fi ;;
+esac
 app="$project/RobloxPlayer.app/Contents/MacOS"
 cd "$app" || exit 1
 # Nothing may run between these exports and exec: every program started
@@ -1008,6 +1002,8 @@ class RobloxSession:
             variables.append(f"MACOBLOX_VRAM_BYTES={vram}")
         if self.settings.get("hide_menu_bar"):
             variables.append("MACOBLOX_HIDE_MENU_BAR=1")
+        if self.settings.get("framerate_cap", 0) > 0:
+            variables.append(f"MACOBLOX_FRAMERATE_CAP={int(self.settings['framerate_cap'])}")
         if self.dns:
             variables.append(f"MACOBLOX_DNS={self.dns.address}")
         if self.audio:

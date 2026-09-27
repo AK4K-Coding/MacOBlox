@@ -29,6 +29,9 @@ RU = {
     "Building shim…": "Сборка шима…",
     "Updating launcher shortcuts…": "Обновление ярлыков лаунчера…",
     "Mac O’ Blox updated successfully": "Mac O’ Blox успешно обновлён",
+    "Mac O’ Blox updated. Restart it to use the new version.":
+        "Mac O’ Blox обновлён. Перезапусти его, чтобы открыть новую версию.",
+    "Could not update the files in {path}:\n{output}": "Не удалось обновить файлы в {path}:\n{output}",
     # Play page
     "Roblox {version}": "Roblox {version}",
     "Roblox not found": "Roblox не найден",
@@ -76,11 +79,7 @@ RU = {
     "Graphics quality": "Качество графики",
     "No shadows": "Без теней",
     "No grass": "Без травы",
-    "Disable post-processing": "Отключить постобработку",
     "Low quality terrain": "Упрощённый рельеф",
-    "Disable global wind": "Отключить глобальный ветер",
-    "Force Voxel lighting": "Освещение Voxel",
-    "Disable telemetry": "Отключить телеметрию",
     "Texture quality override": "Качество текстур",
     "Popular": "Популярные",
     "Roblox only applies flags from its allowlist, some flags may have no effect.":
@@ -135,6 +134,7 @@ RU = {
     "not found": "не найдена",
     "Check for updates": "Проверить обновления",
     "Checking…": "Проверяю…",
+    "Updating…": "Обновляю…",
     "Could not check: {error}": "Не удалось проверить: {error}",
     "The latest version is installed": "Установлена последняя версия",
     "Update to {version}": "Обновить до {version}",

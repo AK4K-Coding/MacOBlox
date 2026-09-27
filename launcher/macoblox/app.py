@@ -18,7 +18,7 @@ APP_ID = "xyz.narez.MacOBlox"
 # Common fast flags. Roblox only honours flags on its client allowlist, so
 # some of these may have no effect in a given client version.
 PRESETS = [
-    {"title": "FPS limit", "subtitle": "GlobalBasicSettings_13 / DFIntTaskSchedulerTargetFps",
+    {"title": "FPS limit", "subtitle": "FramerateCap + DFIntTaskSchedulerTargetFps",
      "flag": "DFIntTaskSchedulerTargetFps", "kind": "fps", "default": 144, "min": 30, "max": 1000},
     {"title": "Graphics quality", "subtitle": "DFIntDebugFRMQualityLevelOverride, 1–21",
      "flag": "DFIntDebugFRMQualityLevelOverride", "kind": "number", "default": 10, "min": 1, "max": 21},
@@ -28,18 +28,12 @@ PRESETS = [
      "flag": "FIntRenderShadowIntensity", "kind": "fixed", "value": 0},
     {"title": "No grass", "subtitle": "FIntFRMMinGrassDistance / FIntFRMMaxGrassDistance = 0",
      "flag": ["FIntFRMMinGrassDistance", "FIntFRMMaxGrassDistance"], "kind": "fixed", "value": 0},
-    {"title": "Disable post-processing", "subtitle": "FFlagDisablePostFx = True",
-     "flag": "FFlagDisablePostFx", "kind": "fixed", "value": True},
     {"title": "Low quality terrain", "subtitle": "FIntTerrainArraySliceSize = 0",
      "flag": "FIntTerrainArraySliceSize", "kind": "fixed", "value": 0},
-    {"title": "Disable global wind", "subtitle": "FFlagGlobalWindControl = False",
-     "flag": "FFlagGlobalWindControl", "kind": "fixed", "value": False},
-    {"title": "Force Voxel lighting", "subtitle": "DFFlagDebugRenderForceTechnologyVoxel = True",
-     "flag": "DFFlagDebugRenderForceTechnologyVoxel", "kind": "fixed", "value": True},
-    {"title": "Disable telemetry", "subtitle": "FFlagDebugDisableTelemetry = True",
-     "flag": "FFlagDebugDisableTelemetry", "kind": "fixed", "value": True},
     {"title": "Texture quality override", "subtitle": "DFIntTextureQualityOverride: 0–3",
-     "flag": "DFIntTextureQualityOverride", "kind": "number", "default": 3, "min": 0, "max": 3},
+     "flag": "DFIntTextureQualityOverride", "kind": "number", "default": 3, "min": 0, "max": 3,
+     # The override is ignored unless this is set too.
+     "also": {"DFFlagTextureQualityOverrideEnabled": True}},
 ]
 
 DNS_CHOICES = [
@@ -234,22 +228,20 @@ class FlagsPage(Adw.PreferencesPage):
             row = Adw.SpinRow.new_with_range(preset["min"], preset["max"], 1)
             row.set_title(_(preset["title"]))
             row.set_subtitle(preset["subtitle"])
-            cap = core.load_framerate_cap(preset["default"])
-            current = self.flags.get(names[0], cap)
+            cap = self.window.settings.get("framerate_cap", 0)
+            current = self.flags.get(names[0], cap if cap > 0 else preset["default"])
             row.set_value(float(current) if str(current).lstrip("-").isdigit() else preset["default"])
-            enabled = bool(names[0] in self.flags or cap > 0)
-            switch = Gtk.Switch(active=enabled, valign=Gtk.Align.CENTER)
+            switch = Gtk.Switch(active=cap > 0 or names[0] in self.flags, valign=Gtk.Align.CENTER)
             row.add_suffix(switch)
 
             def apply(*_args):
-                if switch.get_active():
-                    val = int(row.get_value())
-                    core.save_framerate_cap(val)
-                    for name in names:
-                        self.flags[name] = val
-                else:
-                    core.save_framerate_cap(-1)
-                    for name in names:
+                value = int(row.get_value()) if switch.get_active() else 0
+                # Written into Roblox's settings when the game starts.
+                self.window.set_setting("framerate_cap", value)
+                for name in names:
+                    if value:
+                        self.flags[name] = value
+                    else:
                         self.flags.pop(name, None)
                 self._save()
 
@@ -268,6 +260,8 @@ class FlagsPage(Adw.PreferencesPage):
                 self.preset_setters[name] = set_fps
             return row
         if preset["kind"] == "number":
+            also = preset.get("also", {})
+            self.preset_flags.update(also)
             row = Adw.SpinRow.new_with_range(preset["min"], preset["max"], 1)
             row.set_title(_(preset["title"]))
             row.set_subtitle(preset["subtitle"])
@@ -280,6 +274,11 @@ class FlagsPage(Adw.PreferencesPage):
                 for name in names:
                     if switch.get_active():
                         self.flags[name] = int(row.get_value())
+                    else:
+                        self.flags.pop(name, None)
+                for name, value in also.items():
+                    if switch.get_active():
+                        self.flags[name] = value
                     else:
                         self.flags.pop(name, None)
                 self._save()
@@ -297,6 +296,9 @@ class FlagsPage(Adw.PreferencesPage):
 
             for name in names:
                 self.preset_setters[name] = set_number
+            for name in also:
+                # Imported on its own: set along with the value above.
+                self.preset_setters[name] = lambda value: True
             return row
         row = Adw.SwitchRow(title=_(preset["title"]), subtitle=preset["subtitle"], active=enabled)
 
@@ -803,6 +805,43 @@ def _links():
     return links
 
 
+def _page_sidebar(stack):
+    """The sidebar's page list. Adw.ViewSwitcherSidebar needs libadwaita 1.9;
+    older ones (Ubuntu 24.04 has 1.5, Debian 13 1.7) get a plain list of the
+    same pages."""
+    if hasattr(Adw, "ViewSwitcherSidebar"):
+        sidebar = Adw.ViewSwitcherSidebar()
+        sidebar.set_stack(stack)
+        return sidebar
+    names = []
+    rows = Gtk.ListBox(selection_mode=Gtk.SelectionMode.BROWSE)
+    rows.add_css_class("navigation-sidebar")
+    pages = stack.get_pages()
+    for index in range(pages.get_n_items()):
+        page = pages.get_item(index)
+        line = Gtk.Box(spacing=12)
+        line.append(Gtk.Image(icon_name=page.get_icon_name()))
+        line.append(Gtk.Label(label=page.get_title(), xalign=0))
+        rows.append(line)
+        names.append(page.get_name())
+
+    def selected(_rows, row):
+        if row is not None and stack.get_visible_child_name() != names[row.get_index()]:
+            stack.set_visible_child_name(names[row.get_index()])
+
+    def follow(*_args):
+        name = stack.get_visible_child_name()
+        if name in names:
+            row = rows.get_row_at_index(names.index(name))
+            if rows.get_selected_row() is not row:
+                rows.select_row(row)
+
+    rows.connect("row-selected", selected)
+    stack.connect("notify::visible-child-name", follow)
+    follow()
+    return rows
+
+
 def _open_uri(window, uri):
     Gtk.UriLauncher.new(uri).launch(window, None, None, None)
 
@@ -927,15 +966,13 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.split.set_sidebar_width_fraction(0.28)
         self.split.set_show_sidebar(self.settings.get("show_sidebar", True))
 
-        # Sidebar with native ViewSwitcherSidebar
+        # Sidebar with the page list
         sidebar_toolbar = Adw.ToolbarView()
         sidebar_header = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
         sidebar_header.set_title_widget(Gtk.Label(label="Mac O’ Blox", css_classes=["heading"]))
         sidebar_toolbar.add_top_bar(sidebar_header)
 
-        switcher_sidebar = Adw.ViewSwitcherSidebar()
-        switcher_sidebar.set_stack(self.stack)
-        sidebar_toolbar.set_content(switcher_sidebar)
+        sidebar_toolbar.set_content(_page_sidebar(self.stack))
         self.split.set_sidebar(sidebar_toolbar)
 
         # Content area
