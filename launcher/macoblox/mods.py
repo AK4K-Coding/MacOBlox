@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import shutil
-import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -21,48 +20,6 @@ log = logging.getLogger("macoblox.mods")
 MODS_DIR = core.DATA_DIR / "modifications"
 MODS_BACKUP_DIR = core.DATA_DIR / "mods_backup"
 BUILTIN_MODS_DIR = Path(__file__).resolve().parent / "assets" / "mods"
-EMOJI_CACHE_DIR = core.CACHE_DIR / "emojis"
-
-EMOJI_URLS = {
-    "noto": "https://raw.githubusercontent.com/googlefonts/noto-emoji/v2020-09-16-unicode13_1/fonts/NotoColorEmoji.ttf",
-    "blubmoji": "https://github.com/C1710/blobmoji/releases/download/v15.0/Blobmoji.ttf",
-    "apple": "https://github.com/samuelngs/apple-emoji-linux/releases/download/v18.4/AppleColorEmoji.ttf",
-}
-
-
-def download_emoji_font(emoji_type: str, progress=None) -> Path | None:
-    """Download and cache an emoji font (Noto, Blubmoji, Apple)."""
-    if emoji_type not in EMOJI_URLS:
-        return None
-    url = EMOJI_URLS[emoji_type]
-    EMOJI_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    dest = EMOJI_CACHE_DIR / f"{emoji_type}.ttf"
-    if dest.is_file() and dest.stat().st_size > 500000:
-        return dest
-
-    part = dest.with_suffix(".part")
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "MacOBlox"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            total = int(resp.headers.get("Content-Length") or 0)
-            downloaded = 0
-            with open(part, "wb") as f:
-                while True:
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if progress and total > 0:
-                        progress(downloaded / total)
-        part.replace(dest)
-        log.info("Downloaded emoji font %s (%d bytes)", emoji_type, dest.stat().st_size)
-        return dest
-    except Exception as e:
-        log.warning("Failed to download emoji font %s: %s", emoji_type, e)
-        if part.exists():
-            part.unlink(missing_ok=True)
-        return None
 
 
 def get_content_dir() -> Path:
@@ -122,6 +79,9 @@ def restore_all_mods(content_dir: Path | None = None):
                 custom_font.unlink()
             except OSError:
                 pass
+
+    # Remove backup directory now that everything has been restored cleanly
+    shutil.rmtree(MODS_BACKUP_DIR, ignore_errors=True)
 
 
 def apply_mods(settings: dict[str, Any], content_dir: Path | None = None):
@@ -253,34 +213,7 @@ def apply_mods(settings: dict[str, Any], content_dir: Path | None = None):
                         log.warning("Failed to patch font family %s: %s", json_file.name, e)
                 log.info("Applied custom font %s across all font families.", font_path.name)
 
-    # 5. Emoji style (Twemoji, Noto, Blubmoji, Apple, custom)
-    emoji_type = settings.get("mod_emoji_type", "twemoji")
-    target_emoji = content_dir / "fonts" / "TwemojiMozilla.ttf"
-    if emoji_type == "twemoji":
-        # Default Roblox emoji: restore_all_mods() already restored stock TwemojiMozilla.ttf
-        pass
-    elif emoji_type in EMOJI_URLS:
-        _backup_if_needed(target_emoji, "fonts/TwemojiMozilla.ttf")
-        font_file = download_emoji_font(emoji_type)
-        if font_file and font_file.is_file():
-            try:
-                target_emoji.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(font_file, target_emoji)
-                log.info("Applied %s emoji font to TwemojiMozilla.ttf", emoji_type)
-            except OSError as e:
-                log.warning("Failed to copy emoji font: %s", e)
-    elif emoji_type == "custom":
-        custom_emoji = settings.get("mod_custom_emoji", "")
-        if custom_emoji and Path(custom_emoji).is_file():
-            _backup_if_needed(target_emoji, "fonts/TwemojiMozilla.ttf")
-            try:
-                target_emoji.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(custom_emoji, target_emoji)
-                log.info("Applied custom emoji font from %s", custom_emoji)
-            except OSError as e:
-                log.warning("Failed to copy custom emoji font: %s", e)
-
-    # 6. User custom modifications folder (overlay)
+    # 5. User custom modifications folder (overlay)
     if settings.get("enable_custom_mods", True) and MODS_DIR.is_dir():
         for root, _dirs, files in os.walk(MODS_DIR):
             for file_name in files:

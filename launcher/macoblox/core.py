@@ -88,6 +88,10 @@ DEFAULT_SETTINGS = {
     "keep_logs": 30,
     "show_sidebar": True,
     "framerate_cap": 0,
+    "hide_launcher_on_launch": True,
+    "show_playtime": True,
+    "playtime_seconds": 0,
+    "discord_rpc": True,
     "auto_check_roblox_updates": True,
     "mod_death_sound": "default",
     "mod_custom_death_sound": "",
@@ -95,8 +99,6 @@ DEFAULT_SETTINGS = {
     "mod_cursor_type": "default",
     "mod_custom_cursor": "",
     "mod_custom_font": "",
-    "mod_emoji_type": "twemoji",
-    "mod_custom_emoji": "",
     "enable_custom_mods": True,
 }
 
@@ -179,6 +181,19 @@ def format_flag_value(value):
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)
+
+
+def format_playtime(seconds: int) -> str:
+    """Format playtime in seconds into a concise string like '1M', '2H 15M'."""
+    seconds = max(0, int(seconds))
+    total_mins = seconds // 60
+    if total_mins < 60:
+        return f"{max(1, total_mins)}M" if seconds >= 60 else "0M"
+    hours = total_mins // 60
+    mins = total_mins % 60
+    if mins:
+        return f"{hours}H {mins}M"
+    return f"{hours}H"
 
 
 # ------------------------------------------------------------------ versions
