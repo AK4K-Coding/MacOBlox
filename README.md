@@ -11,8 +11,6 @@
 
 <p align="center">
   <a href="https://discord.gg/bpX9rTttCa"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
-  <a href="https://boosty.to/ega_link"><img src="https://img.shields.io/badge/Boosty-support-F15F2C?logo=boosty&logoColor=white" alt="Boosty"></a>
-  <a href="https://yoomoney.ru/to/4100118196133693"><img src="https://img.shields.io/badge/%D0%AEMoney-support-8B3FFD" alt="YooMoney"></a>
 </p>
 
 <br>
@@ -157,6 +155,9 @@ sound, OpenGL and network to Linux and fixes bugs along the way. Details are in
 </details>
 
 ## Credits
+
+Made by [Narezany](https://github.com/narezy). This version is maintained by
+[aubree.wtf](https://aubree.wtf), with stability and performance fixes.
 
 [Darling](https://www.darlinghq.org) · Tux by Larry Ewing and The GIMP ·
 [Comfortaa](https://github.com/alexeiva/comfortaa) font (SIL OFL) ·

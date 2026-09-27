@@ -164,17 +164,12 @@ RU = {
         "Mac O’ Blox запускает настоящий клиент Roblox для macOS на Linux через Darling. "
         "Его делает не Roblox, и с Roblox он никак не связан.",
     "Community": "Сообщество",
-    "Author": "Автор",
+    "Authors": "Авторы",
     "{user} on Roblox": "{user} в Roblox",
+    "Maintains this version: stability and performance fixes":
+        "Поддерживает эту версию: стабильность и скорость",
     "Made with Claude Opus 5.5": "Сделано с Claude Opus 5.5",
-    "Anthropic's AI wrote the code together with the author": "ИИ от Anthropic писал код вместе с автором",
-    "Support the project": "Поддержать проект",
-    "Mac O’ Blox is free. If it helped you, you can thank the author.":
-        "Mac O’ Blox бесплатный. Если он тебе пригодился, можно поблагодарить автора.",
-    "Boosty": "Boosty",
-    "Cards from any country": "Карты любых стран",
-    "YooMoney": "ЮMoney",
-    "For Russia": "Для России",
+    "Anthropic's AI wrote the code together with the authors": "ИИ от Anthropic писал код вместе с авторами",
 }
 
 

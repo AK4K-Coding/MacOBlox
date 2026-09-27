@@ -657,7 +657,7 @@ class InfoPage(Adw.PreferencesPage):
             community.add(row)
         self.add(community)
 
-        made_by = Adw.PreferencesGroup(title=_("Author"))
+        made_by = Adw.PreferencesGroup(title=_("Authors"))
         self.avatar = Adw.Avatar(size=48, text=author.NAME, show_initials=True)
         profile = Adw.ActionRow(title=author.NAME, activatable=True,
                                 subtitle=_("{user} on Roblox", user="@" + author.ROBLOX_USER))
@@ -665,23 +665,24 @@ class InfoPage(Adw.PreferencesPage):
         profile.add_suffix(Gtk.Image(icon_name="adw-external-link-symbolic"))
         profile.connect("activated", lambda *_args: _open_uri(window, author.PROFILE_URL))
         made_by.add(profile)
+        maintainer_avatar = Adw.Avatar(size=48, text=author.MAINTAINER, show_initials=True)
+        try:
+            maintainer_avatar.set_custom_image(
+                Gdk.Texture.new_from_filename(str(author.MAINTAINER_AVATAR)))
+        except GLib.Error:
+            pass
+        maintainer = Adw.ActionRow(title=author.MAINTAINER, activatable=True,
+                                   subtitle=_("Maintains this version: stability and performance fixes"))
+        maintainer.add_prefix(maintainer_avatar)
+        maintainer.add_suffix(Gtk.Image(icon_name="adw-external-link-symbolic"))
+        maintainer.connect("activated", lambda *_args: _open_uri(window, author.MAINTAINER_URL))
+        made_by.add(maintainer)
         claude = Adw.ActionRow(title=_("Made with Claude Opus 5.5"), activatable=True,
-                               subtitle=_("Anthropic's AI wrote the code together with the author"))
+                               subtitle=_("Anthropic's AI wrote the code together with the authors"))
         claude.add_suffix(Gtk.Image(icon_name="adw-external-link-symbolic"))
         claude.connect("activated", lambda *_args: _open_uri(window, "https://www.anthropic.com/claude"))
         made_by.add(claude)
         self.add(made_by)
-
-        support = Adw.PreferencesGroup(
-            title=_("Support the project"),
-            description=_("Mac O’ Blox is free. If it helped you, you can thank the author."))
-        for title, subtitle, uri in [("Boosty", "Cards from any country", author.BOOSTY_URL),
-                                     ("YooMoney", "For Russia", author.YOOMONEY_URL)]:
-            row = Adw.ActionRow(title=_(title), subtitle=_(subtitle), activatable=True)
-            row.add_suffix(Gtk.Image(icon_name="adw-external-link-symbolic"))
-            row.connect("activated", lambda *_args, u=uri: _open_uri(window, u))
-            support.add(row)
-        self.add(support)
 
         settings = dict(window.settings)
         threading.Thread(target=lambda: GLib.idle_add(self._show_avatar, author.avatar(settings)),

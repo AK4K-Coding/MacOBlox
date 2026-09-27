@@ -1,4 +1,4 @@
-"""Author card, community and donation links for the Info page. No GTK here."""
+"""Author card and community links for the Info page. No GTK here."""
 
 import http.client
 import json
@@ -15,9 +15,12 @@ ROBLOX_USER = "H4Ru_456"
 ROBLOX_ID = 8847914296
 PROFILE_URL = f"https://www.roblox.com/users/{ROBLOX_ID}/profile"
 DISCORD_URL = "https://discord.gg/bpX9rTttCa"
-GITHUB_URL = "https://github.com/narezy/MacOBlox"
-BOOSTY_URL = "https://boosty.to/ega_link"
-YOOMONEY_URL = "https://yoomoney.ru/to/4100118196133693"
+GITHUB_URL = "https://github.com/aubree-lat/MacOBlox"
+
+# Maintainer of this version; the picture ships with the launcher.
+MAINTAINER = "aubree.wtf"
+MAINTAINER_URL = "https://aubree.wtf"
+MAINTAINER_AVATAR = core.PROJECT / "branding" / "contributors" / "aubree.png"
 
 AVATAR = core.CACHE_DIR / "author-avatar.png"
 THUMBNAIL_API = ("https://thumbnails.roblox.com/v1/users/avatar-headshot"
