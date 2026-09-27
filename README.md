@@ -24,7 +24,7 @@ its Windows version through Wine. English and Russian.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/narezy/MacOBlox/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/install.sh | bash
 ```
 
 It installs Darling and everything else, then puts **Mac O’ Blox** in the app
@@ -33,7 +33,7 @@ again for a small menu to update or uninstall. Without a terminal, or for
 scripts, the choices are options too:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/narezy/MacOBlox/main/install.sh | bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/install.sh | bash -s -- --uninstall
 ```
 
 Uninstalling keeps Darling and its prefix, `~/.darling`, which holds your Roblox
@@ -74,7 +74,7 @@ sudo dnf install clang lld unzip pipewire-utils python3-gobject gtk4 libadwaita
 **2. Mac O’ Blox**
 
 ```bash
-git clone https://github.com/narezy/MacOBlox ~/.local/share/MacOBlox
+git clone https://github.com/aubree-lat/MacOBlox ~/.local/share/MacOBlox
 ~/.local/share/MacOBlox/launcher/install.sh
 ```
 </details>

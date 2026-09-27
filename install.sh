@@ -3,7 +3,7 @@
 # launcher itself with its app menu entry. Run it again to update, or to
 # uninstall.
 #
-#   curl -fsSL https://raw.githubusercontent.com/narezy/MacOBlox/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/install.sh | bash
 #
 # In a terminal it shows a small menu; without one it installs. The choices
 # also work as options (with curl: ... | bash -s -- --uninstall), see --help.
@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-REPO=https://github.com/narezy/MacOBlox.git
+REPO=https://github.com/aubree-lat/MacOBlox.git
 DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
 DIR=$DATA_HOME/MacOBlox
 CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
@@ -130,6 +130,12 @@ do_install() {
 
   if [[ -d $DIR/.git ]]; then
     say "Updating Mac O' Blox"
+    # Checkouts from before the move to this fork still point at the original
+    # repository, which does not have its fixes.
+    case $(git -C "$DIR" remote get-url origin 2>/dev/null) in
+      https://github.com/narezy/MacOBlox | https://github.com/narezy/MacOBlox.git)
+        git -C "$DIR" remote set-url origin "$REPO" ;;
+    esac
     git -C "$DIR" pull --ff-only
   else
     say "Downloading Mac O' Blox"
@@ -323,7 +329,7 @@ Mac O' Blox installer
                            also delete Darling's prefix, ${PREFIX/#$HOME/\~} (your Roblox sign-in)
 
 With curl, options go after "bash -s --":
-  curl -fsSL https://raw.githubusercontent.com/narezy/MacOBlox/main/install.sh | bash -s -- --uninstall
+  curl -fsSL https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/install.sh | bash -s -- --uninstall
 USAGE
 }
 
