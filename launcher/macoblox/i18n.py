@@ -130,6 +130,15 @@ RU = {
     "Mouse movement multiplier while rotating the camera":
         "Множитель движения мыши при вращении камеры",
     "Show the launcher after Roblox exits": "Показывать лаунчер после выхода из Roblox",
+    "Hide launcher while playing": "Скрывать лаунчер во время игры",
+    "Hide the launcher window while the game is running": "Скрывать окно лаунчера, пока запущена игра",
+    "Discord Rich Presence": "Discord Rich Presence",
+    "Show current game and playtime in your Discord status": "Показывать статус игры и время в Discord",
+    "Show playtime": "Показывать время в игре",
+    "Show accumulated playtime on the Play page": "Отображать наигранное время на вкладке «Играть»",
+    "Total playtime": "Всего наиграно",
+    "Playing Roblox": "Играет в Roblox",
+    "In Game": "В игре",
     "Hide the macOS menu bar": "Скрывать полоску меню macOS",
     "The Roblox, Edit, Window… strip at the top of the game window":
         "Полоска Roblox, Edit, Window… сверху окна игры",
@@ -273,6 +282,7 @@ RU = {
     "Community": "Сообщество",
     "Authors": "Авторы",
     "{user} on Roblox": "{user} в Roblox",
+    "Better UI, Mods": "Улучшенный интерфейс, моды",
     "Maintains this version: stability and performance fixes":
         "Поддерживает эту версию: стабильность и скорость",
     "Made with Claude Opus 5.5": "Сделано с Claude Opus 5.5",

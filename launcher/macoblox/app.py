@@ -3,6 +3,7 @@
 import json
 import os
 import threading
+import time
 
 import gi
 
@@ -11,7 +12,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-from . import __version__, author, core, dns, i18n, mods, studio  # noqa: E402
+from . import __version__, author, core, discord, dns, i18n, mods, studio  # noqa: E402
 from .i18n import _  # noqa: E402
 
 APP_ID = "wtf.aubree.MacOBlox"
@@ -123,10 +124,15 @@ class PlayPage(Adw.Bin):
 
         action_bar = Gtk.ActionBar()
 
-        version = Gtk.Label(label=f"Mac O’ Blox {__version__}")
-        version.add_css_class("dim-label")
-        version.add_css_class("caption")
-        action_bar.pack_start(version)
+        self.playtime_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.playtime_box.set_valign(Gtk.Align.CENTER)
+        self.playtime_box.add_css_class("dim-label")
+        clock_icon = Gtk.Image(icon_name="preferences-system-time-symbolic")
+        self.playtime_label = Gtk.Label()
+        self.playtime_box.append(clock_icon)
+        self.playtime_box.append(self.playtime_label)
+        self.playtime_box.set_tooltip_text(_("Total playtime"))
+        action_bar.pack_start(self.playtime_box)
 
         self.studio_progress = Gtk.ProgressBar(show_text=True, visible=False)
         self.studio_progress.set_size_request(160, -1)
@@ -135,17 +141,9 @@ class PlayPage(Adw.Bin):
         self.play = Gtk.Button(label=_("Play"))
         self.play.add_css_class("suggested-action")
         self.play.add_css_class("pill")
-        self.play.set_size_request(130, -1)
-        self.play.connect("clicked", lambda *_args: window.play_clicked())
+        self.play.set_size_request(140, -1)
+        self.play.connect("clicked", lambda *_args: self._on_play_clicked())
         action_bar.pack_end(self.play)
-
-        self.stop = Gtk.Button(label=_("Stop Roblox"))
-        self.stop.add_css_class("destructive-action")
-        self.stop.add_css_class("pill")
-        self.stop.set_size_request(130, -1)
-        self.stop.set_visible(False)
-        self.stop.connect("clicked", lambda *_args: window.stop())
-        action_bar.pack_end(self.stop)
 
         self.studio = Gtk.Button(label=_("Roblox Studio"))
         self.studio.add_css_class("pill")
@@ -159,6 +157,19 @@ class PlayPage(Adw.Bin):
         self.set_child(toolbar_view)
         self.refresh()
 
+    def _on_play_clicked(self):
+        if self.window.session is not None:
+            self.window.stop()
+        else:
+            self.window.play_clicked()
+
+    def refresh_playtime(self):
+        show = self.window.settings.get("show_playtime", True)
+        self.playtime_box.set_visible(show)
+        if show:
+            sec = self.window.settings.get("playtime_seconds", 0)
+            self.playtime_label.set_text(core.format_playtime(sec))
+
     def refresh(self):
         running = self.window.session is not None
         busy = self.window.busy
@@ -169,15 +180,25 @@ class PlayPage(Adw.Bin):
         if version and not running and not core.signed_in():
             parts.append(_("Sign in with Quick Login"))
         self.status.set_description(" · ".join(parts))
-        self.play.set_sensitive(not running and not busy)
+
         if running:
-            self.play.set_label(_("Roblox is running"))
+            self.play.set_label(_("Stop Roblox"))
+            self.play.remove_css_class("suggested-action")
+            self.play.add_css_class("destructive-action")
+            self.play.set_sensitive(True)
         elif busy == "starting":
             self.play.set_label(_("Starting…"))
+            self.play.remove_css_class("destructive-action")
+            self.play.add_css_class("suggested-action")
+            self.play.set_sensitive(False)
         else:
             self.play.set_label(_("Play") if version else _("Install Roblox"))
-        self.stop.set_visible(running)
+            self.play.remove_css_class("destructive-action")
+            self.play.add_css_class("suggested-action")
+            self.play.set_sensitive(not busy)
+
         self.log_button.set_visible(self.window.last_log is not None and not running)
+        self.refresh_playtime()
 
 
 class FlagsPage(Adw.PreferencesPage):
@@ -597,11 +618,32 @@ class SettingsPage(Adw.Bin):
         menu_bar.connect("notify::active", lambda row, _pspec: window.set_setting(
             "hide_menu_bar", row.get_active()))
         game.add(menu_bar)
+
+        hide_launcher = Adw.SwitchRow(title=_("Hide launcher while playing"),
+                                      subtitle=_("Hide the launcher window while the game is running"),
+                                      active=settings.get("hide_launcher_on_launch", True))
+        hide_launcher.connect("notify::active", lambda row, _pspec: window.set_setting(
+            "hide_launcher_on_launch", row.get_active()))
+        game.add(hide_launcher)
+
         reopen = Adw.SwitchRow(title=_("Show the launcher after Roblox exits"),
                                active=settings["show_launcher_after_exit"])
         reopen.connect("notify::active", lambda row, _pspec: window.set_setting(
             "show_launcher_after_exit", row.get_active()))
         game.add(reopen)
+
+        discord_rpc = Adw.SwitchRow(title=_("Discord Rich Presence"),
+                                    subtitle=_("Show current game and playtime in your Discord status"),
+                                    active=settings.get("discord_rpc", True))
+        discord_rpc.connect("notify::active", lambda row, _pspec: window.set_discord_rpc(row.get_active()))
+        game.add(discord_rpc)
+
+        playtime_switch = Adw.SwitchRow(title=_("Show playtime"),
+                                        subtitle=_("Show accumulated playtime on the Play page"),
+                                        active=settings.get("show_playtime", True))
+        playtime_switch.connect("notify::active", lambda row, _pspec: window.set_show_playtime(row.get_active()))
+        game.add(playtime_switch)
+
         self.env_page.add(game)
 
         dns_group = Adw.PreferencesGroup(
@@ -1030,7 +1072,7 @@ class InfoPage(Adw.PreferencesPage):
 
         self.ui_contributor_avatar = Adw.Avatar(size=48, text=author.UI_CONTRIBUTOR, show_initials=True)
         ui_contributor = Adw.ActionRow(title=author.UI_CONTRIBUTOR, activatable=True,
-                                       subtitle="Modern UI (vibecoded too)")
+                                       subtitle=_("Better UI, Mods"))
         ui_contributor.add_prefix(self.ui_contributor_avatar)
         ui_contributor.add_suffix(Gtk.Image(icon_name="adw-external-link-symbolic"))
         ui_contributor.connect("activated", lambda *_args: _open_uri(window, author.UI_CONTRIBUTOR_URL))
@@ -1375,6 +1417,8 @@ class LauncherWindow(Adw.ApplicationWindow):
         sidebar_toolbar = Adw.ToolbarView()
         sidebar_header = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
         sidebar_header.set_title_widget(Gtk.Label(label="Mac O’ Blox", css_classes=["heading"]))
+        sidebar_version = Gtk.Label(label=f"v{__version__}", css_classes=["dim-label", "caption"], margin_end=6)
+        sidebar_header.pack_end(sidebar_version)
         sidebar_toolbar.add_top_bar(sidebar_header)
 
         sidebar_toolbar.set_content(_page_sidebar(self.stack))
@@ -1598,6 +1642,33 @@ class LauncherWindow(Adw.ApplicationWindow):
             self.web.stop()
             self.web = None
 
+    def set_discord_rpc(self, enabled):
+        self.set_setting("discord_rpc", enabled)
+        if not enabled:
+            self._stop_rpc()
+        elif self.session:
+            self._start_rpc()
+
+    def set_show_playtime(self, enabled):
+        self.set_setting("show_playtime", enabled)
+        self.play_page.refresh_playtime()
+
+    def _start_rpc(self):
+        if getattr(self, "rpc", None) is None:
+            self.rpc = discord.DiscordRPC()
+        start = getattr(self, "game_started_at", time.time())
+        threading.Thread(target=lambda: self.rpc.update_presence(
+            details=_("Playing Roblox"),
+            state=_("In Game"),
+            start_time=start,
+        ), daemon=True).start()
+
+    def _stop_rpc(self):
+        if getattr(self, "rpc", None):
+            rpc = self.rpc
+            self.rpc = None
+            threading.Thread(target=rpc.close, daemon=True).start()
+
     def _started(self, session, error):
         self.busy = None
         self.quit_when_idle = False  # a game or an error to show: stay
@@ -1609,13 +1680,17 @@ class LauncherWindow(Adw.ApplicationWindow):
             return
         self.session = session
         self.last_log = session.log_path
+        self.game_started_at = time.time()
+        self.last_playtime_save = time.time()
         self.play_page.refresh()
+        if self.settings.get("discord_rpc", True):
+            self._start_rpc()
         # Hide once the game window has had time to appear.
         GLib.timeout_add_seconds(3, self._hide_while_playing)
         GLib.timeout_add(1000, self._watch)
 
     def _hide_while_playing(self):
-        if self.session:
+        if self.session and self.settings.get("hide_launcher_on_launch", True):
             self.set_visible(False)
         return False
 
@@ -1629,9 +1704,17 @@ class LauncherWindow(Adw.ApplicationWindow):
             self.session.finish()
             status = -1
         if status is None:
+            # Active game: track playtime
+            self.settings["playtime_seconds"] = self.settings.get("playtime_seconds", 0) + 1
+            self.play_page.refresh_playtime()
+            if time.time() - getattr(self, "last_playtime_save", 0) > 15:
+                self.last_playtime_save = time.time()
+                core.save_settings(self.settings)
             return True
         self.session = None
         self._stop_web()
+        self._stop_rpc()
+        core.save_settings(self.settings)
         self.play_page.refresh()
         failed = status not in (0, -1)
         # A failure is always shown, even with the launcher set to stay closed.

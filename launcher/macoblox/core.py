@@ -12,6 +12,7 @@ import signal
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 import zipfile
@@ -88,6 +89,10 @@ DEFAULT_SETTINGS = {
     "keep_logs": 30,
     "show_sidebar": True,
     "framerate_cap": 0,
+    "hide_launcher_on_launch": True,
+    "show_playtime": True,
+    "playtime_seconds": 0,
+    "discord_rpc": True,
     "auto_check_roblox_updates": True,
     "mod_death_sound": "default",
     "mod_custom_death_sound": "",
@@ -177,6 +182,19 @@ def format_flag_value(value):
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)
+
+
+def format_playtime(seconds: int) -> str:
+    """Format playtime in seconds into a concise string like '1M', '2H 15M'."""
+    seconds = max(0, int(seconds))
+    total_mins = seconds // 60
+    if total_mins < 60:
+        return f"{max(1, total_mins)}M" if seconds >= 60 else "0M"
+    hours = total_mins // 60
+    mins = total_mins % 60
+    if mins:
+        return f"{hours}H {mins}M"
+    return f"{hours}H"
 
 
 # ------------------------------------------------------------------ versions
@@ -1182,6 +1200,24 @@ class RobloxSession:
             self.process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
                                             stdout=log, stderr=subprocess.STDOUT,
                                             start_new_session=True)
+        self.started_at = time.time()
+        threading.Thread(target=self._suppress_crash_handler, daemon=True).start()
+
+    def _suppress_crash_handler(self):
+        """Terminate RobloxCrashHandler after initial handshake to prevent exit hangs and slow crash logs."""
+        for _ in range(20):
+            time.sleep(1)
+            if not self.process or self.process.poll() is not None:
+                return
+            crash_pids = roblox_pids(("RobloxCrashHandler",))
+            if crash_pids:
+                time.sleep(2)
+                for pid in roblox_pids(("RobloxCrashHandler",)):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                break
 
     def poll(self):
         """None while running, otherwise the exit status (or -1 if unknown)."""
@@ -1191,32 +1227,43 @@ class RobloxSession:
             return status
         if self.audio:
             self.audio.keep_playing()
+        # Suppress any crash handler to prevent slow dumps and exit blockage
+        if self.seen_roblox and time.time() - self.started_at > 3:
+            for pid in roblox_pids(("RobloxCrashHandler",)):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
         # darling shell can outlive a Roblox that was killed; watch the game
         # processes themselves as well. Known ones are checked each second,
         # the whole of /proc only when they are gone or every few seconds.
         now = time.time()
         self.game_pids = [pid for pid in self.game_pids if _process_state(pid) not in (None, "Z")]
-        if not self.game_pids or now - self.scanned_at > 5:
-            self.game_pids = roblox_pids()
+        if not self.game_pids or now - self.scanned_at > 1:
+            self.game_pids = roblox_pids(("RobloxPlayer",))
             self.scanned_at = now
         if self.game_pids:
             self.seen_roblox = True
             self.gone_since = None
         elif self.seen_roblox:
             self.gone_since = self.gone_since or time.time()
-            if time.time() - self.gone_since > 6:
+            if time.time() - self.gone_since > 0.5:
                 self.finish()
                 return -1
         return None
 
     def finish(self):
+        leftover = roblox_pids()
+        if leftover:
+            _terminate(leftover, wait=1)
         if self.process and self.process.poll() is None:
             # Roblox is gone but `darling shell` stayed: end it (it leads its
             # own process group) instead of leaving it behind.
             for sig in (signal.SIGTERM, signal.SIGKILL):
                 try:
                     os.killpg(self.process.pid, sig)
-                    self.process.wait(timeout=3)
+                    self.process.wait(timeout=2)
                     break
                 except (OSError, subprocess.TimeoutExpired):
                     pass

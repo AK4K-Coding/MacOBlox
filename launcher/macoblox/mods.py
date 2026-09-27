@@ -80,6 +80,9 @@ def restore_all_mods(content_dir: Path | None = None):
             except OSError:
                 pass
 
+    # Remove backup directory now that everything has been restored cleanly
+    shutil.rmtree(MODS_BACKUP_DIR, ignore_errors=True)
+
 
 def apply_mods(settings: dict[str, Any], content_dir: Path | None = None):
     """Applies user selected mod presets and custom folder overrides."""
