@@ -9,8 +9,9 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+from pathlib import Path  # noqa: E402
 
-from . import __version__, author, core, dns, i18n, studio  # noqa: E402
+from . import __version__, author, core, dns, i18n, mods, studio  # noqa: E402
 from .i18n import _  # noqa: E402
 
 APP_ID = "wtf.aubree.MacOBlox"
@@ -186,6 +187,7 @@ class FlagsPage(Adw.PreferencesPage):
         self.flags = core.load_fast_flags()
         self.preset_flags = set()
         self.preset_setters = {}  # flag -> function(value) that shows it in its row
+        self.preset_resetters = []
         self._save_timer = 0
 
         presets = Adw.PreferencesGroup(
@@ -203,8 +205,12 @@ class FlagsPage(Adw.PreferencesPage):
         import_button = Gtk.Button(label=_("Import JSON"), valign=Gtk.Align.CENTER)
         import_button.add_css_class("flat")
         import_button.connect("clicked", lambda *_args: self._import_dialog())
+        export_button = Gtk.Button(label=_("Export JSON"), valign=Gtk.Align.CENTER)
+        export_button.add_css_class("flat")
+        export_button.connect("clicked", lambda *_args: self._export_dialog())
         suffix = Gtk.Box(spacing=6)
         suffix.append(import_button)
+        suffix.append(export_button)
         suffix.append(add_button)
         self.custom.set_header_suffix(suffix)
         self.add(self.custom)
@@ -217,6 +223,12 @@ class FlagsPage(Adw.PreferencesPage):
         path_row = Adw.ActionRow(title=_("File"), subtitle=str(core.FAST_FLAGS))
         path_row.set_subtitle_selectable(True)
         file_group.add(path_row)
+
+        reset_flags_btn = _button_row(_("Reset all fast flags"))
+        reset_flags_btn.add_css_class("destructive-action")
+        reset_flags_btn.connect("activated", lambda *_args: self._reset_dialog())
+        file_group.add(reset_flags_btn)
+
         self.add(file_group)
 
     # -- presets
@@ -258,6 +270,7 @@ class FlagsPage(Adw.PreferencesPage):
 
             for name in names:
                 self.preset_setters[name] = set_fps
+            self.preset_resetters.append(lambda: (switch.set_active(False), row.set_value(preset["default"])))
             return row
         if preset["kind"] == "number":
             also = preset.get("also", {})
@@ -299,6 +312,7 @@ class FlagsPage(Adw.PreferencesPage):
             for name in also:
                 # Imported on its own: set along with the value above.
                 self.preset_setters[name] = lambda value: True
+            self.preset_resetters.append(lambda: (switch.set_active(False), row.set_value(preset["default"])))
             return row
         row = Adw.SwitchRow(title=_(preset["title"]), subtitle=preset["subtitle"], active=enabled)
 
@@ -323,6 +337,7 @@ class FlagsPage(Adw.PreferencesPage):
 
         for name in names:
             self.preset_setters[name] = lambda value, n=name: set_fixed(value, n)
+        self.preset_resetters.append(lambda: row.set_active(False))
         return row
 
     # -- custom flags
@@ -412,6 +427,95 @@ class FlagsPage(Adw.PreferencesPage):
 
         dialog.connect("response", response)
         dialog.present(self.window)
+
+    def _export_dialog(self):
+        text = json.dumps(self.flags, indent=2)
+        dialog = Adw.AlertDialog(
+            heading=_("Export fast flags"),
+            body=_("Copy flags to clipboard or save to a file."),
+        )
+        view = Gtk.TextView(wrap_mode=Gtk.WrapMode.NONE, monospace=True, editable=False)
+        view.set_size_request(420, 220)
+        buffer = view.get_buffer()
+        buffer.set_text(text)
+        scroller = Gtk.ScrolledWindow(child=view, min_content_height=220)
+        scroller.add_css_class("card")
+        dialog.set_extra_child(scroller)
+
+        dialog.add_response("close", _("Close"))
+        dialog.add_response("copy", _("Copy"))
+        dialog.add_response("save", _("Save to file…"))
+        dialog.set_response_appearance("copy", Adw.ResponseAppearance.SUGGESTED)
+
+        def response(_dialog, result):
+            if result == "copy":
+                display = Gdk.Display.get_default()
+                if display:
+                    display.get_clipboard().set(text)
+                    _toast(self.window.toasts, _("Flags copied to clipboard"))
+            elif result == "save":
+                self._save_export_file(text)
+
+        dialog.connect("response", response)
+        dialog.present(self.window)
+
+    def _save_export_file(self, text):
+        dialog = Gtk.FileChooserNative.new(
+            _("Save fast flags"),
+            self.window,
+            Gtk.FileChooserAction.SAVE,
+            _("Save"),
+            _("Cancel"),
+        )
+        dialog.set_current_name("ClientAppSettings.json")
+        f = Gtk.FileFilter()
+        f.set_name("JSON files (*.json)")
+        f.add_pattern("*.json")
+        dialog.add_filter(f)
+
+        def on_response(d, res):
+            if res == Gtk.ResponseType.ACCEPT:
+                file = d.get_file()
+                if file:
+                    try:
+                        Path(file.get_path()).write_text(text, encoding="utf-8")
+                        _toast(self.window.toasts, _("Flags saved to {path}", path=Path(file.get_path()).name))
+                    except OSError as e:
+                        _error_dialog(self.window, _("Could not save flags: {error}", error=e))
+            d.destroy()
+
+        dialog.connect("response", on_response)
+        dialog.show()
+
+    def _reset_dialog(self):
+        dialog = Adw.AlertDialog(
+            heading=_("Reset all fast flags?"),
+            body=_("All custom flags and presets will be cleared and reset to default."),
+        )
+        dialog.add_response("cancel", _("Cancel"))
+        dialog.add_response("reset", _("Reset"))
+        dialog.set_response_appearance("reset", Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def response(_dialog, result):
+            if result == "reset":
+                self._reset_all_flags()
+
+        dialog.connect("response", response)
+        dialog.present(self.window)
+
+    def _reset_all_flags(self):
+        self.flags.clear()
+        core.save_framerate_cap(-1)
+        core.save_fast_flags({})
+
+        for reset_func in self.preset_resetters:
+            reset_func()
+
+        for entry in list(self.custom_rows):
+            self.custom.remove(entry["row"])
+        self.custom_rows.clear()
+
+        _toast(self.window.toasts, _("All fast flags have been reset"))
 
     def _save(self):
         """Save shortly after the last change: typing a value or spinning a
@@ -573,10 +677,25 @@ class SettingsPage(Adw.Bin):
         self._update_handler = self.update_button.connect("clicked", lambda *_args: self.check_updates())
         self.version_row.add_suffix(self.update_button)
         roblox.add(self.version_row)
+
+        self.auto_update_switch = Adw.SwitchRow(
+            title=_("Check for Roblox updates on startup"),
+            subtitle=_("Prompt to update if a newer version of Roblox is available"),
+            active=settings.get("auto_check_roblox_updates", True),
+        )
+        self.auto_update_switch.connect("notify::active", lambda row, _pspec: window.set_setting(
+            "auto_check_roblox_updates", row.get_active()))
+        roblox.add(self.auto_update_switch)
+
         self.progress = Gtk.ProgressBar(show_text=True, margin_top=6, margin_bottom=6,
                                         margin_start=12, margin_end=12, visible=False)
         progress_row = Gtk.ListBoxRow(activatable=False, selectable=False, child=self.progress)
         roblox.add(progress_row)
+
+        delete_roblox = _button_row(_("Delete Roblox"))
+        delete_roblox.add_css_class("destructive-action")
+        delete_roblox.connect("activated", lambda *_args: self.delete_roblox())
+        roblox.add(delete_roblox)
         self.roblox_page.add(roblox)
 
         account = Adw.PreferencesGroup(title=_("Account"))
@@ -764,6 +883,31 @@ class SettingsPage(Adw.Bin):
         dialog.connect("response", response)
         dialog.present(self.window)
 
+    def delete_roblox(self):
+        if self.window.session:
+            _toast(self.window.toasts, _("Close Roblox first"))
+            return
+        if not core.installed_version():
+            _toast(self.window.toasts, _("Roblox is not installed"))
+            return
+        dialog = Adw.AlertDialog(
+            heading=_("Delete Roblox?"),
+            body=_("RobloxPlayer.app and all mod modifications will be removed from your computer.")
+        )
+        dialog.add_response("cancel", _("Cancel"))
+        dialog.add_response("delete", _("Delete"))
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def response(_dialog, result):
+            if result == "delete":
+                core.delete_roblox()
+                self.version_row.set_subtitle(_("not found"))
+                self.window.play_page.refresh()
+                _toast(self.window.toasts, _("Roblox deleted successfully"))
+
+        dialog.connect("response", response)
+        dialog.present(self.window)
+
     def rebuild(self):
         if not self.window.begin("building"):
             return
@@ -922,6 +1066,265 @@ class InfoPage(Adw.PreferencesPage):
         return False
 
 
+class ModsPage(Adw.Bin):
+    def __init__(self, window):
+        super().__init__()
+        self.window = window
+        settings = window.settings
+
+        page = Adw.PreferencesPage()
+
+        # 1. Sound presets
+        sounds_group = Adw.PreferencesGroup(title=_("Sound presets"))
+
+        death_choices = [
+            ("default", _("Default (Roblox)")),
+            ("classic_oof", _("Classic OOF")),
+            ("custom", _("Custom sound")),
+        ]
+        self._death_codes = [c[0] for c in death_choices]
+        cur_death = settings.get("mod_death_sound", "default")
+        cur_death_idx = self._death_codes.index(cur_death) if cur_death in self._death_codes else 0
+
+        self.death_sound_row = Adw.ComboRow(
+            title=_("Death sound"),
+            subtitle=_("Choose the sound played when your character resets or dies"),
+            model=Gtk.StringList.new([c[1] for c in death_choices]),
+            selected=cur_death_idx,
+        )
+        self.death_sound_row.connect("notify::selected", self._on_death_sound_selected)
+        sounds_group.add(self.death_sound_row)
+
+        self.custom_death_row = Adw.ActionRow(
+            title=_("Custom death sound file"),
+            subtitle=settings.get("mod_custom_death_sound") or _("No file chosen"),
+            visible=(cur_death == "custom"),
+        )
+        custom_death_btn = Gtk.Button(label=_("Choose…"), valign=Gtk.Align.CENTER)
+        custom_death_btn.connect("clicked", lambda *_args: self._choose_custom_death_sound())
+        self.custom_death_row.add_suffix(custom_death_btn)
+        sounds_group.add(self.custom_death_row)
+
+        old_sounds_switch = Adw.SwitchRow(
+            title=_("Classic movement sounds"),
+            subtitle=_("Restores 2006-2014 walking, jumping, getting up, and silent landing sounds"),
+            active=settings.get("mod_old_character_sounds", False),
+        )
+        old_sounds_switch.connect("notify::active", lambda row, _pspec: window.set_setting(
+            "mod_old_character_sounds", row.get_active()))
+        sounds_group.add(old_sounds_switch)
+
+        page.add(sounds_group)
+
+        # 2. Mouse cursors
+        cursors_group = Adw.PreferencesGroup(title=_("Mouse cursors"))
+
+        cursor_choices = [
+            ("default", _("Default")),
+            ("2006", _("2006 Classic")),
+            ("2013", _("2013 Retro")),
+            ("dot", _("Black & White Dot")),
+            ("purple_cross", _("Purple Cross")),
+            ("custom", _("Custom cursor")),
+        ]
+        self._cursor_codes = [c[0] for c in cursor_choices]
+        cur_cursor = settings.get("mod_cursor_type", "default")
+        cur_cursor_idx = self._cursor_codes.index(cur_cursor) if cur_cursor in self._cursor_codes else 0
+
+        self.cursor_row = Adw.ComboRow(
+            title=_("Cursor style"),
+            subtitle=_("Replaces in-game mouse cursors"),
+            model=Gtk.StringList.new([c[1] for c in cursor_choices]),
+            selected=cur_cursor_idx,
+        )
+        self.cursor_row.connect("notify::selected", self._on_cursor_selected)
+        cursors_group.add(self.cursor_row)
+
+        self.custom_cursor_row = Adw.ActionRow(
+            title=_("Custom cursor file or folder"),
+            subtitle=settings.get("mod_custom_cursor") or _("No file chosen"),
+            visible=(cur_cursor == "custom"),
+        )
+        custom_cursor_btn = Gtk.Button(label=_("Choose…"), valign=Gtk.Align.CENTER)
+        custom_cursor_btn.connect("clicked", lambda *_args: self._choose_custom_cursor())
+        self.custom_cursor_row.add_suffix(custom_cursor_btn)
+        cursors_group.add(self.custom_cursor_row)
+
+        page.add(cursors_group)
+
+        # 3. Typography
+        fonts_group = Adw.PreferencesGroup(title=_("Typography"))
+
+        cur_font = settings.get("mod_custom_font", "")
+        self.font_row = Adw.ActionRow(
+            title=_("Custom font"),
+            subtitle=Path(cur_font).name if cur_font else _("No custom font selected"),
+        )
+        choose_font_btn = Gtk.Button(label=_("Choose font…"), valign=Gtk.Align.CENTER)
+        choose_font_btn.connect("clicked", lambda *_args: self._choose_font())
+        self.font_row.add_suffix(choose_font_btn)
+
+        clear_font_btn = Gtk.Button(icon_name="edit-clear-symbolic", valign=Gtk.Align.CENTER)
+        clear_font_btn.add_css_class("flat")
+        clear_font_btn.set_tooltip_text(_("Clear font"))
+        clear_font_btn.connect("clicked", lambda *_args: self._clear_font())
+        self.font_row.add_suffix(clear_font_btn)
+
+        fonts_group.add(self.font_row)
+        page.add(fonts_group)
+
+        # 4. User modifications
+        mods_group = Adw.PreferencesGroup(title=_("User modifications"))
+
+        custom_mods_switch = Adw.SwitchRow(
+            title=_("Enable modifications folder"),
+            subtitle=_("Overlay files from modifications/ onto the Roblox client"),
+            active=settings.get("enable_custom_mods", True),
+        )
+        custom_mods_switch.connect("notify::active", lambda row, _pspec: window.set_setting(
+            "enable_custom_mods", row.get_active()))
+        mods_group.add(custom_mods_switch)
+
+        open_folder_row = Adw.ActionRow(
+            title=_("Open modifications folder"),
+            subtitle=_("Drop your custom textures, sounds, and models here"),
+        )
+        open_folder_btn = Gtk.Button(label=_("Open"), valign=Gtk.Align.CENTER)
+        open_folder_btn.connect("clicked", lambda *_args: self._open_mods_folder())
+        open_folder_row.add_suffix(open_folder_btn)
+        mods_group.add(open_folder_row)
+
+        page.add(mods_group)
+
+        # 5. Management
+        mgmt_group = Adw.PreferencesGroup(title=_("Management"))
+
+        apply_btn = _button_row(_("Apply mods now"))
+        apply_btn.connect("activated", lambda *_args: self._apply_mods_now())
+        mgmt_group.add(apply_btn)
+
+        reset_btn = _button_row(_("Reset all mods to default"))
+        reset_btn.add_css_class("destructive-action")
+        reset_btn.connect("activated", lambda *_args: self._reset_mods())
+        mgmt_group.add(reset_btn)
+
+        page.add(mgmt_group)
+
+        self.set_child(page)
+
+    def _on_death_sound_selected(self, row, _pspec):
+        code = self._death_codes[row.get_selected()]
+        self.window.set_setting("mod_death_sound", code)
+        self.custom_death_row.set_visible(code == "custom")
+
+    def _on_cursor_selected(self, row, _pspec):
+        code = self._cursor_codes[row.get_selected()]
+        self.window.set_setting("mod_cursor_type", code)
+        self.custom_cursor_row.set_visible(code == "custom")
+
+    def _choose_custom_death_sound(self):
+        dialog = Gtk.FileChooserNative.new(
+            _("Select custom death sound (.ogg)"),
+            self.window,
+            Gtk.FileChooserAction.OPEN,
+            _("Select"),
+            _("Cancel"),
+        )
+        f = Gtk.FileFilter()
+        f.set_name("Audio files (*.ogg)")
+        f.add_pattern("*.ogg")
+        dialog.add_filter(f)
+
+        def on_response(d, res):
+            if res == Gtk.ResponseType.ACCEPT:
+                file = d.get_file()
+                if file:
+                    path = file.get_path()
+                    self.window.set_setting("mod_custom_death_sound", path)
+                    self.custom_death_row.set_subtitle(path)
+            d.destroy()
+
+        dialog.connect("response", on_response)
+        dialog.show()
+
+    def _choose_custom_cursor(self):
+        dialog = Gtk.FileChooserNative.new(
+            _("Select custom cursor (.png or folder)"),
+            self.window,
+            Gtk.FileChooserAction.OPEN,
+            _("Select"),
+            _("Cancel"),
+        )
+        f = Gtk.FileFilter()
+        f.set_name("PNG Images (*.png)")
+        f.add_pattern("*.png")
+        dialog.add_filter(f)
+
+        def on_response(d, res):
+            if res == Gtk.ResponseType.ACCEPT:
+                file = d.get_file()
+                if file:
+                    path = file.get_path()
+                    self.window.set_setting("mod_custom_cursor", path)
+                    self.custom_cursor_row.set_subtitle(path)
+            d.destroy()
+
+        dialog.connect("response", on_response)
+        dialog.show()
+
+    def _choose_font(self):
+        dialog = Gtk.FileChooserNative.new(
+            _("Select font (.ttf, .otf)"),
+            self.window,
+            Gtk.FileChooserAction.OPEN,
+            _("Select"),
+            _("Cancel"),
+        )
+        f = Gtk.FileFilter()
+        f.set_name("Font files (*.ttf, *.otf)")
+        f.add_pattern("*.ttf")
+        f.add_pattern("*.otf")
+        dialog.add_filter(f)
+
+        def on_response(d, res):
+            if res == Gtk.ResponseType.ACCEPT:
+                file = d.get_file()
+                if file:
+                    path = file.get_path()
+                    self.window.set_setting("mod_custom_font", path)
+                    self.font_row.set_subtitle(Path(path).name)
+            d.destroy()
+
+        dialog.connect("response", on_response)
+        dialog.show()
+
+    def _clear_font(self):
+        self.window.set_setting("mod_custom_font", "")
+        self.font_row.set_subtitle(_("No custom font selected"))
+
+    def _open_mods_folder(self):
+        folder = mods.ensure_mods_dir()
+        try:
+            Gio.AppInfo.launch_default_for_uri(folder.as_uri(), None)
+        except Exception:
+            import subprocess
+            subprocess.Popen(["xdg-open", str(folder)])
+
+    def _apply_mods_now(self):
+        try:
+            mods.apply_mods(self.window.settings)
+            _toast(self.window.toasts, _("Mods applied"))
+        except Exception as e:
+            _error_dialog(self.window, _("Error applying mods"), str(e))
+
+    def _reset_mods(self):
+        try:
+            mods.restore_all_mods()
+            _toast(self.window.toasts, _("All mods have been reset"))
+        except Exception as e:
+            _error_dialog(self.window, _("Error resetting mods"), str(e))
+
+
 class LauncherWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Mac O’ Blox")
@@ -949,6 +1352,8 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.stack.add_titled_with_icon(self.play_page, "play", _("Play"), "media-playback-start-symbolic")
         self.settings_page = SettingsPage(self)
         self.stack.add_titled_with_icon(self.settings_page, "settings", _("Settings"), "emblem-system-symbolic")
+        self.mods_page = ModsPage(self)
+        self.stack.add_titled_with_icon(self.mods_page, "mods", _("Mods"), "extension-symbolic")
         self.info_page = InfoPage(self)
         self.stack.add_titled_with_icon(self.info_page, "info", _("Info"), "help-about-symbolic")
         self.flags_page = self.settings_page.flags_page
@@ -1004,8 +1409,19 @@ class LauncherWindow(Adw.ApplicationWindow):
             has_update, tag, html_url = core.check_launcher_update()
             if has_update:
                 GLib.idle_add(self._show_launcher_update_dialog, tag)
+                return
         except Exception:
             pass
+
+        if self.settings.get("auto_check_roblox_updates", True):
+            try:
+                installed = core.installed_version()
+                if installed:
+                    latest, upload = core.latest_version()
+                    if latest != installed:
+                        GLib.idle_add(self._show_roblox_update_dialog, latest, upload)
+            except Exception:
+                pass
 
     def _show_launcher_update_dialog(self, tag):
         dialog = Adw.AlertDialog(
@@ -1021,6 +1437,24 @@ class LauncherWindow(Adw.ApplicationWindow):
                 self.stack.set_visible_child_name("settings")
                 self.settings_page.set_tab("env")
                 self.settings_page.force_update_launcher()
+
+        dialog.connect("response", response)
+        dialog.present(self)
+
+    def _show_roblox_update_dialog(self, latest, upload):
+        dialog = Adw.AlertDialog(
+            heading=_("Roblox update available"),
+            body=_("A newer version of Roblox ({version}) is available. Update now?", version=latest),
+        )
+        dialog.add_response("later", _("Later"))
+        dialog.add_response("update", _("Update"))
+        dialog.set_response_appearance("update", Adw.ResponseAppearance.SUGGESTED)
+
+        def response(_dialog, result):
+            if result == "update":
+                self.stack.set_visible_child_name("settings")
+                self.settings_page.set_tab("roblox")
+                self.settings_page.install_update(upload)
 
         dialog.connect("response", response)
         dialog.present(self)

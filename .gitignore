@@ -5,6 +5,8 @@
 /logs/
 /build/
 /studio/
+/modifications/
+/mods_backup/
 *.dylib
 __pycache__/
 
