@@ -61,6 +61,7 @@ CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "ma
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 
 DARLING_HOME = DARLING_PREFIX / "Users" / os.environ.get("USER", "user")
+GLOBAL_BASIC_SETTINGS = DARLING_HOME / "Library" / "Roblox" / "GlobalBasicSettings_13.xml"
 SESSION_FILES = [
     DARLING_HOME / "Library" / "MacOBlox" / "Cookies.plist",
     DARLING_HOME / "Library" / "MacOBlox" / "Keychain",
@@ -84,6 +85,7 @@ DEFAULT_SETTINGS = {
     "fps_log": False,
     "trace_keys": False,
     "keep_logs": 30,
+    "show_sidebar": True,
 }
 
 # Settings -> environment variables understood by the shim.
@@ -165,6 +167,44 @@ def format_flag_value(value):
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)
+
+
+def load_framerate_cap(default=144):
+    """Load FramerateCap from GlobalBasicSettings_13.xml."""
+    try:
+        text = GLOBAL_BASIC_SETTINGS.read_text(encoding="utf-8")
+        m = re.search(r'<int name="FramerateCap">(-?\d+)</int>', text)
+        if m:
+            val = int(m.group(1))
+            return val if val > 0 else default
+    except (OSError, ValueError):
+        pass
+    return default
+
+
+def save_framerate_cap(fps):
+    """Write FramerateCap to GlobalBasicSettings_13.xml for native FPS uncap."""
+    try:
+        GLOBAL_BASIC_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+        if GLOBAL_BASIC_SETTINGS.exists():
+            text = GLOBAL_BASIC_SETTINGS.read_text(encoding="utf-8")
+            if '<int name="FramerateCap">' in text:
+                text = re.sub(r'<int name="FramerateCap">-?\d+</int>', f'<int name="FramerateCap">{fps}</int>', text)
+            else:
+                text = text.replace("</Properties>", f'\t\t\t<int name="FramerateCap">{fps}</int>\n\t\t</Properties>')
+        else:
+            text = (
+                '<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" version="4">\n'
+                '\t<Item class="UserGameSettings">\n'
+                '\t\t<Properties>\n'
+                f'\t\t\t<int name="FramerateCap">{fps}</int>\n'
+                '\t\t</Properties>\n'
+                '\t</Item>\n'
+                '</roblox>\n'
+            )
+        _write_atomically(GLOBAL_BASIC_SETTINGS, text)
+    except OSError as error:
+        print("Could not save FramerateCap to GlobalBasicSettings_13:", error)
 
 
 # ------------------------------------------------------------------ versions
