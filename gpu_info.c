@@ -74,6 +74,44 @@ static CFTypeRef macoblox_IORegistryEntryCreateCFProperty(io_registry_entry_t en
 }
 DYLD_INTERPOSE(macoblox_IORegistryEntryCreateCFProperty, IORegistryEntryCreateCFProperty)
 
+/* Physical screen size. Darling's CGDisplayScreenSize returns the display's
+ * pixel size as millimetres (a two-metre-wide screen), and 0x0 for a
+ * display ID that is not one of its screens: its IDs are 1-based positions
+ * in NSDisplay's screen list, not the CGDirectDisplayIDs Roblox may derive
+ * elsewhere. Roblox scales its interface by it, and a zero size sent a
+ * Fedora KDE user's client into an endless updateSurfaceLuaApp loop until
+ * the stack overflowed. Answer the size at 96 DPI of the display's bounds,
+ * of the main display for an unknown ID, or of 1920x1080 before AppKit has
+ * screens. Unknown IDs get the main display's bounds too. */
+typedef struct { double x, y, width, height; } macoblox_rect; /* CGRect */
+typedef struct { double width, height; } macoblox_size;       /* CGSize */
+__attribute__((weak_import)) extern macoblox_rect CGDisplayBounds(unsigned int);
+__attribute__((weak_import)) extern macoblox_size CGDisplayScreenSize(unsigned int);
+__attribute__((weak_import)) extern unsigned int CGMainDisplayID(void);
+
+static macoblox_rect macoblox_CGDisplayBounds(unsigned int display) {
+    macoblox_rect bounds = CGDisplayBounds(display);
+    if (bounds.width <= 0 || bounds.height <= 0) {
+        unsigned int main_display = CGMainDisplayID();
+        if (main_display && main_display != display)
+            bounds = CGDisplayBounds(main_display);
+        static int reported;
+        if (!reported++)
+            write(2, "[MacOBlox] CGDisplayBounds: unknown display, using the main display\n", 68);
+    }
+    return bounds;
+}
+DYLD_INTERPOSE(macoblox_CGDisplayBounds, CGDisplayBounds)
+
+static macoblox_size macoblox_CGDisplayScreenSize(unsigned int display) {
+    macoblox_rect bounds = macoblox_CGDisplayBounds(display);
+    double width = bounds.width > 0 ? bounds.width : 1920;
+    double height = bounds.height > 0 ? bounds.height : 1080;
+    macoblox_size size = {width * 25.4 / 96.0, height * 25.4 / 96.0};
+    return size;
+}
+DYLD_INTERPOSE(macoblox_CGDisplayScreenSize, CGDisplayScreenSize)
+
 /* Darling's CGDisplayIOServicePort returns 0, and Roblox then never asks for
  * IOFBMemorySize. Hand out a stand-in entry; the property hook above answers
  * IOFBMemorySize for it, other IOKit calls on it simply fail. */
