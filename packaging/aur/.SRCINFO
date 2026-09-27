@@ -15,6 +15,7 @@ pkgbase = macoblox-git
 	depends = python-gobject
 	depends = gtk4
 	depends = libadwaita
+	depends = webkitgtk-6.0
 	provides = macoblox
 	conflicts = macoblox
 	source = git+https://github.com/narezy/MacOBlox.git

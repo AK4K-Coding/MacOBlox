@@ -13,7 +13,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 from . import __version__, author, core, dns, i18n, studio  # noqa: E402
 from .i18n import _  # noqa: E402
 
-APP_ID = "xyz.narez.MacOBlox"
+APP_ID = "wtf.aubree.MacOBlox"
 
 # Common fast flags. Roblox only honours flags on its client allowlist, so
 # some of these may have no effect in a given client version.
@@ -1058,10 +1058,11 @@ class LauncherWindow(Adw.ApplicationWindow):
     def _captcha_dialog(self):
         dialog = Adw.AlertDialog(
             heading=_("Roblox closed at the captcha"),
-            body=_("Signing up and signing in with a password show a captcha in a built-in browser, "
-                   "which does not work here yet. Create the account on roblox.com, then sign in "
-                   "with Quick Login: Roblox shows a code, enter it on a phone or in a browser "
-                   "where you are already signed in."))
+            body=_("Signing up and signing in with a password show a captcha in a built-in browser. "
+                   "The launcher shows it in a window of its own when WebKitGTK 6.0 is installed "
+                   "(webkitgtk-6.0, gir1.2-webkit-6.0 or webkitgtk6.0). Without it, create the "
+                   "account on roblox.com, then sign in with Quick Login: Roblox shows a code, "
+                   "enter it on a phone or in a browser where you are already signed in."))
         dialog.add_response("ok", _("OK"))
         dialog.present(self)
 
@@ -1134,6 +1135,10 @@ class LauncherWindow(Adw.ApplicationWindow):
             return
         self.settings_page.flush()
         session = core.RobloxSession(dict(self.settings))
+        self.web = self._web_bridge()
+        if self.web:
+            session.web_socket = self.web.guest_path
+            session.web_user_agent = self.web.user_agent
 
         def start():
             try:
@@ -1144,10 +1149,26 @@ class LauncherWindow(Adw.ApplicationWindow):
 
         threading.Thread(target=start, daemon=True).start()
 
+    def _web_bridge(self):
+        """The browser window for Roblox's embedded pages (sign-in with a
+        password, purchases), or None when WebKitGTK is not installed."""
+        try:
+            from . import web
+            return web.WebBridge(self)
+        except Exception as error:  # a missing WebKit, a socket that cannot be made
+            print("Embedded web pages are not available:", error)
+            return None
+
+    def _stop_web(self):
+        if getattr(self, "web", None):
+            self.web.stop()
+            self.web = None
+
     def _started(self, session, error):
         self.busy = None
         self.quit_when_idle = False  # a game or an error to show: stay
         if error:
+            self._stop_web()
             self.set_visible(True)
             self.play_page.refresh()
             _error_dialog(self, _("Could not start Roblox"), str(error) or repr(error))
@@ -1176,6 +1197,7 @@ class LauncherWindow(Adw.ApplicationWindow):
         if status is None:
             return True
         self.session = None
+        self._stop_web()
         self.play_page.refresh()
         failed = status not in (0, -1)
         # A failure is always shown, even with the launcher set to stay closed.

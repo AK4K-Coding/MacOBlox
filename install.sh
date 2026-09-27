@@ -22,7 +22,7 @@ CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
 CACHE_HOME=${XDG_CACHE_HOME:-$HOME/.cache}
 PREFIX=${DPREFIX:-$HOME/.darling}
 # Darling's Debian packages, pinned to the release the Flatpak uses
-# (flatpak/xyz.narez.MacOBlox.yml; change both together). The checksum makes
+# (flatpak/wtf.aubree.MacOBlox.yml; change both together). The checksum makes
 # sure the download is that release, and a new Darling release cannot break
 # installs before the shim was tested with it.
 DARLING_TAG=v0.1.20260608
@@ -53,7 +53,7 @@ install_arch() {
   # Only packages that are not installed at all: asking pacman for an
   # installed but outdated one (pipewire-audio 1.6.8 with 1.6.9 in the repo)
   # makes it a partial upgrade that breaks on pinned dependencies.
-  local wanted=(git base-devel clang lld unzip python python-gobject gtk4 libadwaita)
+  local wanted=(git base-devel clang lld unzip python python-gobject gtk4 libadwaita webkitgtk-6.0)
   command -v pw-cat >/dev/null || wanted+=(pipewire-audio)
   local missing
   missing=$(pacman -T "${wanted[@]}" || true)
@@ -82,7 +82,7 @@ install_debian() {
   say "Installing tools (apt)"
   sudo apt-get update
   sudo apt-get install -y git curl unzip clang lld pipewire-bin python3 python3-gi \
-    gir1.2-gtk-4.0 gir1.2-adw-1
+    gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-webkit-6.0
   command -v darling >/dev/null && return
   # Release v0.1.YYYYMMDD has its Debian packages (built for Ubuntu 24.04)
   # as debs_YYYYMMDD.zip.
@@ -102,7 +102,7 @@ install_debian() {
 
 install_fedora() {
   say "Installing tools (dnf)"
-  sudo dnf install -y git clang lld unzip pipewire-utils python3-gobject gtk4 libadwaita
+  sudo dnf install -y git clang lld unzip pipewire-utils python3-gobject gtk4 libadwaita webkitgtk6.0
 }
 
 do_install() {
@@ -179,16 +179,20 @@ do_uninstall() {
   fi
   say "Removing the app menu entries, icons and the macoblox command"
   local apps=$DATA_HOME/applications
-  rm -f -- "$apps/xyz.narez.MacOBlox.desktop" "$apps/xyz.narez.MacOBlox.Studio.desktop" \
+  # The xyz.narez.* names are the app ID before 0.15.
+  rm -f -- "$apps/wtf.aubree.MacOBlox.desktop" "$apps/wtf.aubree.MacOBlox.Studio.desktop" \
+    "$apps/xyz.narez.MacOBlox.desktop" "$apps/xyz.narez.MacOBlox.Studio.desktop" \
     "$apps/macoblox-roblox-window.desktop" "$apps/org.macoblox.Launcher.desktop" \
-    "$DATA_HOME"/icons/hicolor/*/apps/macoblox.png "$DATA_HOME/mime/packages/xyz.narez.MacOBlox.xml"
+    "$DATA_HOME"/icons/hicolor/*/apps/macoblox.png "$DATA_HOME/mime/packages/wtf.aubree.MacOBlox.xml" \
+    "$DATA_HOME/mime/packages/xyz.narez.MacOBlox.xml"
   local link=$HOME/.local/bin/macoblox
   if [[ -L $link && $(readlink "$link") == */macoblox-launcher ]]; then
     rm -f -- "$link"
   fi
   # Studio as the handler of roblox-studio: links and place files.
   if [[ -f $CONFIG_HOME/mimeapps.list ]]; then
-    sed -i -e 's/xyz\.narez\.MacOBlox\.Studio\.desktop;\{0,1\}//g' -e '/^[^=[]*=$/d' "$CONFIG_HOME/mimeapps.list"
+    sed -i -e 's/wtf\.aubree\.MacOBlox\.Studio\.desktop;\{0,1\}//g' \
+      -e 's/xyz\.narez\.MacOBlox\.Studio\.desktop;\{0,1\}//g' -e '/^[^=[]*=$/d' "$CONFIG_HOME/mimeapps.list"
   fi
   update-mime-database "$DATA_HOME/mime" >/dev/null 2>&1 || true
   update-desktop-database "$apps" >/dev/null 2>&1 || true

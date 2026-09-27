@@ -1,12 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>xyz.narez.MacOBlox</id>
+  <id>wtf.aubree.MacOBlox</id>
   <name>Mac O’ Blox</name>
   <summary>Play Roblox on Linux with the macOS client</summary>
   <summary xml:lang="ru">Roblox на Linux через клиент для macOS</summary>
-  <developer id="xyz.narez">
-    <name>Narezany</name>
+  <developer id="wtf.aubree">
+    <name>aubree.wtf</name>
   </developer>
+  <replaces>
+    <id>xyz.narez.MacOBlox</id>
+  </replaces>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
   <description>
@@ -20,10 +23,12 @@
       и чинит графику, ввод, звук и производительность. Лаунчер сам обновляет клиент,
       в нём есть настройки фастфлагов, DNS и диагностика.
     </p>
+    <p>Created by Narezany; this version is maintained by aubree.wtf.</p>
+    <p xml:lang="ru">Создал Narezany; эту версию поддерживает aubree.wtf.</p>
     <p>Mac O’ Blox is not affiliated with Roblox Corporation.</p>
     <p xml:lang="ru">Mac O’ Blox не связан с Roblox Corporation.</p>
   </description>
-  <launchable type="desktop-id">xyz.narez.MacOBlox.desktop</launchable>
+  <launchable type="desktop-id">wtf.aubree.MacOBlox.desktop</launchable>
   <screenshots>
     <screenshot type="default">
       <image>https://raw.githubusercontent.com/aubree-lat/MacOBlox/main/flatpak/screenshots/roblox.png</image>
@@ -62,6 +67,11 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.15" date="2026-09-27">
+      <description>
+        <p>Signing in with a password and other embedded pages open in the launcher's own browser window. New app ID wtf.aubree.MacOBlox. Fixes for a Fedora KDE crash loop and for Darling's thread stacks.</p>
+      </description>
+    </release>
     <release version="0.14" date="2026-09-26">
       <description>
         <p>Fixes for freezes, stutter, audio dropouts and slow loading, and the Roblox sign-in cookie is only sent to Roblox.</p>

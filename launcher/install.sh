@@ -5,6 +5,7 @@ set -euo pipefail
 launcher_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 project_dir=$(dirname -- "$launcher_dir")
 data_home=${XDG_DATA_HOME:-$HOME/.local/share}
+config_home=${XDG_CONFIG_HOME:-$HOME/.config}
 
 for size in 16 22 24 32 48 64 128 256 512; do
   install -Dm644 "$project_dir/branding/icons/macoblox-$size.png" \
@@ -23,7 +24,7 @@ exec_path=${exec_path//\$/\\\\\$}
 exec_path=\"${exec_path//%/%%}/macoblox-launcher\"
 
 install -d "$data_home/applications"
-cat > "$data_home/applications/xyz.narez.MacOBlox.desktop" <<DESKTOP
+cat > "$data_home/applications/wtf.aubree.MacOBlox.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=Mac O’ Blox
@@ -41,7 +42,7 @@ DESKTOP
 
 # Roblox Studio (Windows version through Wine), also the handler of the
 # roblox-studio: links and of roblox-studio-auth: that signs Studio in.
-cat > "$data_home/applications/xyz.narez.MacOBlox.Studio.desktop" <<DESKTOP
+cat > "$data_home/applications/wtf.aubree.MacOBlox.Studio.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=Roblox Studio (Mac O’ Blox)
@@ -56,17 +57,24 @@ StartupWMClass=robloxstudiobeta.exe
 DESKTOP
 # Place files (.rbxl, .rbxlx) as their own type, so file managers open them
 # with Studio: no MIME database defines one.
-install -Dm644 "$project_dir/packaging/xyz.narez.MacOBlox.xml" "$data_home/mime/packages/xyz.narez.MacOBlox.xml"
+install -Dm644 "$project_dir/packaging/wtf.aubree.MacOBlox.xml" "$data_home/mime/packages/wtf.aubree.MacOBlox.xml"
 update-mime-database "$data_home/mime" 2>/dev/null || true
 if command -v xdg-mime >/dev/null; then
   for type in x-scheme-handler/roblox-studio x-scheme-handler/roblox-studio-auth application/x-roblox-place; do
-    xdg-mime default xyz.narez.MacOBlox.Studio.desktop "$type"
+    xdg-mime default wtf.aubree.MacOBlox.Studio.desktop "$type"
   done
 fi
 
-# Old app ID; removed after the new entry exists so menus that rescan on the
-# first change (noctalia) do not miss it.
-rm -f "$data_home/applications/org.macoblox.Launcher.desktop"
+# Old app IDs (org.macoblox.Launcher before 0.10, xyz.narez.MacOBlox before
+# 0.15); removed after the new entries exist so menus that rescan on the
+# first change (noctalia) do not miss them.
+rm -f "$data_home/applications/org.macoblox.Launcher.desktop" \
+  "$data_home/applications/xyz.narez.MacOBlox.desktop" \
+  "$data_home/applications/xyz.narez.MacOBlox.Studio.desktop" \
+  "$data_home/mime/packages/xyz.narez.MacOBlox.xml"
+if [ -f "$config_home/mimeapps.list" ]; then
+  sed -i -e 's/xyz\.narez\.MacOBlox\.Studio\.desktop;\{0,1\}//g' -e '/^[^=[]*=$/d' "$config_home/mimeapps.list"
+fi
 
 # The game window itself (X11 class RobloxPlayer) gets the same icon in docks.
 cat > "$data_home/applications/macoblox-roblox-window.desktop" <<DESKTOP

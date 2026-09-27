@@ -1463,13 +1463,48 @@ static void crash_handler(int sig, void* info, void* uap) {
             print_addr_info("  RDI info: ", (void*)mc[6]);
             print_addr_info("  RSI info: ", (void*)mc[7]);
 
+            // Raw stack words that look like user-space addresses, innermost
+            // and outermost: a trail through code without frame pointers
+            // (the host's GPU driver), where the walk below finds nothing.
+            write_str("\n[MacOBlox Stack Words near RSP]:\n");
+            // A stack overflow leaves RSP in the guard page: start above it.
+            unsigned long long* sp = (unsigned long long*)((mc[9] + 0x1000) & ~0xfffULL);
+            int shown = 0;
+            for (int i = 0; i < 4096; i++) {
+                unsigned long long word = sp[i];
+                if (word < 0x7f0000000000ULL || word >= 0x800000000000ULL) continue;
+                print_hex(word);
+                write_str(++shown % 6 ? " " : "\n");
+            }
+            extern void* pthread_get_stackaddr_np(void*);
+            extern void* pthread_self(void);
+            unsigned long long* top = (unsigned long long*)pthread_get_stackaddr_np(pthread_self());
+            write_str("\n[MacOBlox Stack Words near the stack top ");
+            print_hex((unsigned long long)top);
+            write_str("]:\n");
+            shown = 0;
+            if (top && (unsigned long long)top > mc[9] && (unsigned long long)top - mc[9] > 16384) {
+                for (int i = 2048; i > 0; i--) {
+                    unsigned long long word = top[-i];
+                    if (word < 0x7f0000000000ULL || word >= 0x800000000000ULL) continue;
+                    print_hex(word);
+                    write_str(++shown % 6 ? " " : "\n");
+                }
+            }
+            write_str("\n");
             write_str("\n[MacOBlox Stack Walk from RBP]:\n");
             void** fp = (void**)mc[8];
+            unsigned long long low = mc[9];
+            unsigned long long high = (unsigned long long)top > mc[9] ? (unsigned long long)top : mc[9] + (1ULL << 20);
             for (int i = 0; i < 30 && fp; i++) {
-                if ((unsigned long long)fp < 0x1000 || ((unsigned long long)fp & 7)) break;
+                // Code without frame pointers leaves other values in RBP:
+                // only follow ones inside this stack, going up.
+                if ((unsigned long long)fp < low || (unsigned long long)fp >= high ||
+                    ((unsigned long long)fp & 7)) break;
                 void* ret_addr = fp[1];
                 write_str("  #"); print_num(i); write_str(" ");
                 print_addr_info("", ret_addr);
+                low = (unsigned long long)fp + 16;
                 fp = (void**)fp[0];
             }
         }
@@ -3090,8 +3125,15 @@ static id hooked_web_view_load_request(id self, SEL cmd, id request) {
     macoblox_log_url("[MacOBlox Web] WKWebView loadRequest: ", url);
     return orig_web_view_load_request(self, cmd, request);
 }
+// Links open in the launcher's browser window when it is there
+// (web_bridge.m); roblox:// links go to the client's own URL handler.
+extern int macoblox_web_open_url(id url);
 static MacOBloxBool (*orig_workspace_open_url)(id, SEL, id) = 0;
 static MacOBloxBool hooked_workspace_open_url(id self, SEL cmd, id url) {
+    if (url && macoblox_web_open_url(url)) {
+        write_str("[MacOBlox Web] NSWorkspace openURL: shown by the launcher\n");
+        return 1;
+    }
     MacOBloxBool result = orig_workspace_open_url(self, cmd, url);
     macoblox_log_url(result ? "[MacOBlox Web] NSWorkspace openURL: (ok) "
                             : "[MacOBlox Web] NSWorkspace openURL: (failed) ", url);
