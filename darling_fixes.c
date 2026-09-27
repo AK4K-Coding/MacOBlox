@@ -265,21 +265,29 @@ static int macoblox_pthread_mutex_unlock(void *mutex) {
 }
 DYLD_INTERPOSE(macoblox_pthread_mutex_unlock, pthread_mutex_unlock)
 
-/* Thread stacks: every Darling system call goes through an RPC to
- * darlingserver, which needs much more stack than the macOS kernel call it
- * replaces. FMOD creates its audio threads with small stacks that are enough
- * on macOS; under Darling one overflowed inside the RPC code
+/* Thread stacks: Darwin gives a thread 512 KB unless its creator asks for
+ * more, Linux 8 MB, and host code that runs on these stacks was built for
+ * Linux's. Every Darling system call goes through an RPC to darlingserver,
+ * which needs much more stack than the macOS kernel call it replaces: FMOD
+ * creates its audio threads with small stacks that are enough on macOS, and
+ * under Darling one overflowed inside the RPC code
  * (dserver_rpc_hooks_receive_message, stack pointer just below its last
- * page) a few seconds after a game with sound started. Raise small requested
- * stack sizes to 1 MB. Threads with a caller-provided stack are left alone:
- * the stack is only as large as the caller made it. */
+ * page) a few seconds after a game with sound started. NVIDIA's shader
+ * compiler (libnvidia-glcore) overflowed a default 512 KB thread compiling
+ * Vulkan pipelines for the Metal renderer. So every thread gets at least
+ * 8 MB, as on Linux, also those created without attributes (std::thread);
+ * that only reserves address space, pages are used as the stack grows.
+ * Threads with a caller-provided stack are left alone: the stack is only as
+ * large as the caller made it. */
 typedef struct { long opaque[8]; } darwin_pthread_attr_t; /* 64 bytes on x86_64 */
+extern int pthread_attr_init(darwin_pthread_attr_t *);
+extern int pthread_attr_destroy(darwin_pthread_attr_t *);
 extern int pthread_attr_setstacksize(darwin_pthread_attr_t *, unsigned long);
 extern int pthread_attr_getstacksize(const darwin_pthread_attr_t *, unsigned long *);
 extern int pthread_attr_getstackaddr(const darwin_pthread_attr_t *, void **);
 extern int pthread_create(void **, const darwin_pthread_attr_t *, void *(*)(void *), void *);
 
-#define MIN_THREAD_STACK (1UL << 20)
+#define MIN_THREAD_STACK (8UL << 20)
 
 static int macoblox_pthread_attr_setstacksize(darwin_pthread_attr_t *attr, unsigned long size) {
     void *address = 0;
@@ -291,16 +299,141 @@ DYLD_INTERPOSE(macoblox_pthread_attr_setstacksize, pthread_attr_setstacksize)
 
 static int macoblox_pthread_create(void **thread, const darwin_pthread_attr_t *attr,
                                    void *(*start)(void *), void *argument) {
-    if (attr) {
-        void *address = 0;
-        unsigned long size = 0;
-        if (pthread_attr_getstackaddr(attr, &address) == 0 && !address &&
-            pthread_attr_getstacksize(attr, &size) == 0 && size < MIN_THREAD_STACK)
-            pthread_attr_setstacksize((darwin_pthread_attr_t *)attr, MIN_THREAD_STACK);
+    if (!attr) {
+        /* Defaults (joinable, inherited scheduling), with a Linux-sized stack. */
+        darwin_pthread_attr_t larger;
+        if (pthread_attr_init(&larger) != 0)
+            return pthread_create(thread, attr, start, argument);
+        pthread_attr_setstacksize(&larger, MIN_THREAD_STACK);
+        int result = pthread_create(thread, &larger, start, argument);
+        pthread_attr_destroy(&larger);
+        return result;
     }
+    void *address = 0;
+    unsigned long size = 0;
+    if (pthread_attr_getstackaddr(attr, &address) == 0 && !address &&
+        pthread_attr_getstacksize(attr, &size) == 0 && size < MIN_THREAD_STACK)
+        pthread_attr_setstacksize((darwin_pthread_attr_t *)attr, MIN_THREAD_STACK);
     return pthread_create(thread, attr, start, argument);
 }
 DYLD_INTERPOSE(macoblox_pthread_create, pthread_create)
+
+/* GCD's worker threads do not come from pthread_create: Darling's
+ * workq_kernreturn starts them with a fixed 512 KB stack through
+ * darling_thread_create, an entry of its ELF loader's function table
+ * (elfcalls, reached through the _elfcalls pointer). Metal work on a
+ * dispatch queue compiled NVIDIA shaders on such a thread and overflowed
+ * it. The entry is wrapped so that threads whose stack Darling allocates
+ * (no thread structure passed in) get MIN_THREAD_STACK too; Darling records
+ * the size it allocated and frees exactly that when the thread ends.
+ * Threads that bring their own stack (libpthread's) pass through. */
+typedef void *(*darling_thread_create_function)(unsigned long stack_size, unsigned long thread_object_size,
+                                                void *entry, unsigned long arg3, unsigned long arg4,
+                                                unsigned long arg5, unsigned long arg6,
+                                                const void *callbacks, void *thread_structure);
+struct darling_elf_calls { /* the start of mldr's struct elf_calls */
+    void *dlopen, *dlclose, *dlsym, *dlerror;
+    darling_thread_create_function darling_thread_create;
+};
+extern void *dlsym(void *, const char *);
+static darling_thread_create_function darling_thread_create_original;
+
+static void *macoblox_darling_thread_create(unsigned long stack_size, unsigned long thread_object_size,
+                                            void *entry, unsigned long arg3, unsigned long arg4,
+                                            unsigned long arg5, unsigned long arg6,
+                                            const void *callbacks, void *thread_structure) {
+    if (!thread_structure && stack_size < MIN_THREAD_STACK)
+        stack_size = MIN_THREAD_STACK;
+    return darling_thread_create_original(stack_size, thread_object_size, entry, arg3, arg4, arg5, arg6,
+                                          callbacks, thread_structure);
+}
+
+__attribute__((constructor)) static void macoblox_wrap_darling_thread_create(void) {
+    struct darling_elf_calls **table = dlsym((void *)-2 /* RTLD_DEFAULT */, "_elfcalls");
+    if (!table || !*table || !(*table)->darling_thread_create ||
+        (*table)->darling_thread_create == macoblox_darling_thread_create)
+        return;
+    darling_thread_create_original = (*table)->darling_thread_create;
+    (*table)->darling_thread_create = macoblox_darling_thread_create;
+}
+
+/* A GCD worker thread that finishes its work goes back to Darling's
+ * workq_kernreturn, which parks it and, when there is new work, jumps to
+ * libpthread's _start_wqthread again (wqueue_entry_point_asm_jump). The
+ * macOS kernel restarts such a thread on a fresh stack; Darling does not
+ * reset the stack pointer, so every reuse runs on top of the frames of the
+ * previous one and a busy worker's stack only grows: with the Metal
+ * renderer's completion handlers it overflowed 512 KB in seconds and 8 MB
+ * in a minute (the fault shows up in whatever runs at the bottom, usually
+ * NVIDIA's shader compiler, whose frames are large). Darling keeps the jump
+ * target in a private pointer in libsystem_kernel's data; it is found as
+ * the one word in its data sections that holds _start_wqthread and pointed at a
+ * trampoline that restarts the stack at its top. A workqueue thread's
+ * pthread structure sits right above its stack (in XNU and in Darling), so
+ * the top is the thread's own pthread_t, the first argument (rdi); nothing
+ * that outlives the jump is on that stack (the thread's exit context is on
+ * its native Linux stack). MACOBLOX_NATIVE_WORKQUEUE=1 keeps Darling's. */
+__attribute__((visibility("hidden"))) void *macoblox_wqthread_original;
+extern void macoblox_start_wqthread(void);
+__asm__(".text\n"
+        ".p2align 4\n"
+        "_macoblox_start_wqthread:\n"
+        "    movq %rdi, %rsp\n"
+        "    jmpq *_macoblox_wqthread_original(%rip)\n");
+
+extern unsigned int _dyld_image_count(void);
+extern const char *_dyld_get_image_name(unsigned int);
+extern const void *_dyld_get_image_header(unsigned int);
+extern unsigned char *getsectiondata(const void *, const char *, const char *, unsigned long *);
+extern long write(int, const void *, unsigned long);
+
+static void macoblox_log(const char *text) {
+    unsigned long length = 0;
+    while (text[length]) length++;
+    write(2, text, length);
+}
+
+__attribute__((constructor)) static void macoblox_reset_workqueue_stacks(void) {
+    const char *keep = getenv("MACOBLOX_NATIVE_WORKQUEUE");
+    if (keep && keep[0] == '1')
+        return;
+    void *entry = dlsym((void *)-2 /* RTLD_DEFAULT */, "start_wqthread");
+    if (!entry)
+        return;
+    for (unsigned int image = 0; image < _dyld_image_count(); image++) {
+        const char *name = _dyld_get_image_name(image);
+        unsigned long length = 0;
+        while (name && name[length]) length++;
+        static const char suffix[] = "/libsystem_kernel.dylib";
+        if (length < sizeof suffix - 1) continue;
+        int same = 1;
+        for (unsigned long i = 0; i < sizeof suffix - 1; i++)
+            same &= name[length - (sizeof suffix - 1) + i] == suffix[i];
+        if (!same) continue;
+        void **found = 0;
+        int matches = 0;
+        /* It is in __common. Not __bss: under Darling, reading it past
+         * its first pages faults. */
+        static const char *const sections[] = {"__data", "__common"};
+        for (unsigned int s = 0; s < 2; s++) {
+            unsigned long size = 0;
+            void **words = (void **)getsectiondata(_dyld_get_image_header(image), "__DATA", sections[s], &size);
+            for (unsigned long i = 0; words && i < size / sizeof(void *); i++)
+                if (words[i] == entry) {
+                    found = &words[i];
+                    matches++;
+                }
+        }
+        if (matches == 1) {
+            macoblox_wqthread_original = entry;
+            __atomic_store_n(found, (void *)macoblox_start_wqthread, __ATOMIC_RELEASE);
+            macoblox_log("[MacOBlox] GCD worker threads restart on a fresh stack\n");
+        } else {
+            macoblox_log("[MacOBlox] Darling's workqueue entry not found, GCD worker stacks unchanged\n");
+        }
+        return;
+    }
+}
 
 /* Condition variables (see the top of this file). A pthread_cond_t is 48
  * bytes; after its signature they hold a small lock and the queue of

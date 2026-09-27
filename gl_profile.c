@@ -220,6 +220,12 @@ static void *macoblox_eglCreateWindowSurface(void *display, void *config, unsign
     void *surface = eglCreateWindowSurface(display, config, window, attributes);
     if (surface) {
         forget_configured_surface(surface); /* a new surface at an old address */
+        const char *trace = getenv("MACOBLOX_TRACE_CGL");
+        if (trace && trace[0] == '1') {
+            char line[160];
+            snprintf(line, sizeof line, "[MacOBlox GL] eglCreateWindowSurface window 0x%lx -> surface %p\n", window, surface);
+            log_line(line);
+        }
         return surface;
     }
     int error = eglGetError();
