@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://discord.gg/bpX9rTttCa"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="https://discord.gg/jCjHYYNq48"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
 <br>
@@ -94,7 +94,7 @@ Mac O’ Blox is not made by Roblox, using it is at your own risk.
 <summary>Something does not work</summary>
 
 When Roblox does not start, the launcher shows the error with a **Copy**
-button. Send it to the [Discord](https://discord.gg/bpX9rTttCa). The last
+button. Send it to the [Discord](https://discord.gg/jCjHYYNq48). The last
 error is also saved in `~/.cache/macoblox/last-error.txt`.
 </details>
 
@@ -129,7 +129,7 @@ how to open the `roblox-studio-auth` link, choose **Roblox Studio (Mac O’ Blox
 The Flatpak brings Darling along and runs it without root (see
 [flatpak/darling-noroot.c](flatpak/darling-noroot.c)), so nothing has to be
 installed on the system. Download `MacOBlox-*.flatpak` from the
-[latest release](https://github.com/narezy/MacOBlox/releases/latest), then:
+[latest release](https://github.com/aubree-lat/MacOBlox/releases/latest), then:
 
 ```bash
 flatpak install --user MacOBlox-0.13-x86_64.flatpak

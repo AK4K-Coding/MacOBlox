@@ -145,7 +145,7 @@ do_install() {
   local output
   if ! output=$("$DIR/build_debug_shim.sh" 2>&1); then
     printf '%s\n' "$output" >&2
-    die "Could not build the shim. Send the text above to the Discord: https://discord.gg/bpX9rTttCa"
+    die "Could not build the shim. Send the text above to the Discord: https://discord.gg/jCjHYYNq48"
   fi
   "$DIR/launcher/install.sh"
   say "Done. Open Mac O' Blox from the app menu, press Install Roblox, then Play."

@@ -14,7 +14,7 @@ NAME = "Narezany"
 ROBLOX_USER = "H4Ru_456"
 ROBLOX_ID = 8847914296
 PROFILE_URL = f"https://www.roblox.com/users/{ROBLOX_ID}/profile"
-DISCORD_URL = "https://discord.gg/bpX9rTttCa"
+DISCORD_URL = "https://discord.gg/jCjHYYNq48"
 GITHUB_URL = "https://github.com/aubree-lat/MacOBlox"
 
 # Maintainer of this version; the picture ships with the launcher.
