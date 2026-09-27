@@ -158,7 +158,7 @@ sound, OpenGL and network to Linux and fixes bugs along the way. Details are in
 ## Credits
 
 Made by [Narezany](https://github.com/narezy). This version is maintained by
-[aubree.wtf](https://aubree.wtf), with stability and performance fixes. UI by [TinyTosha](https://github.com/amethyst-bin): Modern UI (vibecoded too).
+[aubree.wtf](https://aubree.wtf), with stability and performance fixes.
 
 [Darling](https://www.darlinghq.org) · Tux by Larry Ewing and The GIMP ·
 [Comfortaa](https://github.com/alexeiva/comfortaa) font (SIL OFL) ·
