@@ -59,6 +59,8 @@ FAST_FLAGS = APP_BUNDLE / "Contents" / "MacOS" / "ClientSettings" / "ClientAppSe
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "macoblox"
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "macoblox"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
+# Cookies and site data of Roblox's embedded web pages (web.py): sign-in state.
+WEB_DATA_DIR = CONFIG_DIR / "web"
 
 DARLING_HOME = DARLING_PREFIX / "Users" / os.environ.get("USER", "user")
 SESSION_FILES = [
@@ -536,6 +538,7 @@ def exit_reason(log_path):
 def logout():
     """Delete the saved Roblox session. Returns True when it is gone.
     Blocks up to a minute: call it off the GTK thread."""
+    shutil.rmtree(WEB_DATA_DIR, ignore_errors=True)
     # Files inside ~/.darling must not be removed from the host while
     # darlingserver runs: its overlay then stops showing new files to the host.
     if darlingserver_running():
@@ -991,6 +994,10 @@ class RobloxSession:
         self.scanned_at = 0.0
         self.dns = None
         self.audio = None
+        # The launcher's browser window for Roblox's embedded pages (web.py):
+        # its socket as the guest sees it, and WebKit's user agent.
+        self.web_socket = None
+        self.web_user_agent = None
 
     def environment(self):
         return darling_environment()
@@ -1004,6 +1011,10 @@ class RobloxSession:
             variables.append("MACOBLOX_HIDE_MENU_BAR=1")
         if self.settings.get("framerate_cap", 0) > 0:
             variables.append(f"MACOBLOX_FRAMERATE_CAP={int(self.settings['framerate_cap'])}")
+        if self.web_socket:
+            variables.append(f"MACOBLOX_WEB_SOCKET={self.web_socket}")
+            if self.web_user_agent:
+                variables.append(f"MACOBLOX_WEB_USER_AGENT={self.web_user_agent}")
         if self.dns:
             variables.append(f"MACOBLOX_DNS={self.dns.address}")
         if self.audio:

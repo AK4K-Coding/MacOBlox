@@ -50,7 +50,7 @@ Arch, CachyOS, EndeavourOS, Manjaro:
 
 ```bash
 paru -S darling-bin
-sudo pacman -S clang lld unzip pipewire-audio python-gobject gtk4 libadwaita
+sudo pacman -S clang lld unzip pipewire-audio python-gobject gtk4 libadwaita webkitgtk-6.0
 ```
 
 Debian, Ubuntu, Mint: download `debs_20260608.zip` from the
@@ -60,14 +60,14 @@ Debian, Ubuntu, Mint: download `debs_20260608.zip` from the
 ```bash
 unzip debs_*.zip -d darling-debs
 sudo apt install ./darling-debs/*/*.deb
-sudo apt install clang lld unzip pipewire-bin python3-gi gir1.2-gtk-4.0 gir1.2-adw-1
+sudo apt install clang lld unzip pipewire-bin python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-webkit-6.0
 ```
 
 Fedora and others: build Darling with the
 [official guide](https://docs.darlinghq.org/build-instructions.html), then:
 
 ```bash
-sudo dnf install clang lld unzip pipewire-utils python3-gobject gtk4 libadwaita
+sudo dnf install clang lld unzip pipewire-utils python3-gobject gtk4 libadwaita webkitgtk6.0
 ```
 
 **2. Mac O’ Blox**
@@ -102,10 +102,12 @@ error is also saved in `~/.cache/macoblox/last-error.txt`.
 <details>
 <summary>How do I sign in?</summary>
 
-Create the account on [roblox.com](https://www.roblox.com) first: signing up,
-and signing in with a password, show a captcha that does not work here yet.
-Then sign in in Mac O’ Blox with **Quick Login**: Roblox shows a code, enter it
-on a phone or in a browser where you are already signed in.
+Signing up and signing in with a password show a captcha in a web page, which
+Darling cannot display; Mac O’ Blox opens it in a window of its own instead
+(it needs WebKitGTK 6.0, which the installer brings along). Without that
+window, create the account on [roblox.com](https://www.roblox.com) first and
+sign in in Mac O’ Blox with **Quick Login**: Roblox shows a code, enter it on a
+phone or in a browser where you are already signed in.
 </details>
 
 <details>
@@ -142,7 +144,7 @@ is not in the Flatpak yet. To build it yourself:
 ```bash
 flatpak install --user flathub org.flatpak.Builder org.gnome.Sdk//50 org.freedesktop.Sdk.Extension.llvm22//25.08
 cd MacOBlox/flatpak
-flatpak run --env=FLATPAK_USER_DIR=$HOME/.local/share/flatpak --command=flatpak-builder org.flatpak.Builder --user --install --force-clean build-dir xyz.narez.MacOBlox.yml
+flatpak run --env=FLATPAK_USER_DIR=$HOME/.local/share/flatpak --command=flatpak-builder org.flatpak.Builder --user --install --force-clean build-dir wtf.aubree.MacOBlox.yml
 ```
 </details>
 

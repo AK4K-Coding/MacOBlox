@@ -48,13 +48,21 @@ RU = {
     "Install Roblox": "Установить Roblox",
     "Sign in with Quick Login": "Входи через Quick Login",
     "Roblox closed at the captcha": "Roblox закрылся на капче",
-    "Signing up and signing in with a password show a captcha in a built-in browser, "
-    "which does not work here yet. Create the account on roblox.com, then sign in "
-    "with Quick Login: Roblox shows a code, enter it on a phone or in a browser "
-    "where you are already signed in.":
-        "Регистрация и вход по паролю показывают капчу во встроенном браузере, а он здесь пока "
-        "не работает. Создай аккаунт на roblox.com, потом войди через Quick Login: Roblox "
-        "покажет код, введи его на телефоне или в браузере, где ты уже вошёл.",
+    "Signing up and signing in with a password show a captcha in a built-in browser. "
+    "The launcher shows it in a window of its own when WebKitGTK 6.0 is installed "
+    "(webkitgtk-6.0, gir1.2-webkit-6.0 or webkitgtk6.0). Without it, create the "
+    "account on roblox.com, then sign in with Quick Login: Roblox shows a code, "
+    "enter it on a phone or in a browser where you are already signed in.":
+        "Регистрация и вход по паролю показывают капчу во встроенном браузере. Лаунчер "
+        "открывает её в своём окне, если установлен WebKitGTK 6.0 (webkitgtk-6.0, "
+        "gir1.2-webkit-6.0 или webkitgtk6.0). Без него создай аккаунт на roblox.com, потом "
+        "войди через Quick Login: Roblox покажет код, введи его на телефоне или в браузере, "
+        "где ты уже вошёл.",
+    "Back": "Назад",
+    "Forward": "Вперёд",
+    "Reload": "Обновить",
+    "Back to Roblox": "Вернуться в Roblox",
+    "Close": "Закрыть",
     "OK": "Понятно",
     "Roblox Studio": "Roblox Studio",
     "Roblox Studio is already running": "Roblox Studio уже запущен",

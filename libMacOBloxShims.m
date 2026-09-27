@@ -3125,8 +3125,15 @@ static id hooked_web_view_load_request(id self, SEL cmd, id request) {
     macoblox_log_url("[MacOBlox Web] WKWebView loadRequest: ", url);
     return orig_web_view_load_request(self, cmd, request);
 }
+// Links open in the launcher's browser window when it is there
+// (web_bridge.m); roblox:// links go to the client's own URL handler.
+extern int macoblox_web_open_url(id url);
 static MacOBloxBool (*orig_workspace_open_url)(id, SEL, id) = 0;
 static MacOBloxBool hooked_workspace_open_url(id self, SEL cmd, id url) {
+    if (url && macoblox_web_open_url(url)) {
+        write_str("[MacOBlox Web] NSWorkspace openURL: shown by the launcher\n");
+        return 1;
+    }
     MacOBloxBool result = orig_workspace_open_url(self, cmd, url);
     macoblox_log_url(result ? "[MacOBlox Web] NSWorkspace openURL: (ok) "
                             : "[MacOBlox Web] NSWorkspace openURL: (failed) ", url);

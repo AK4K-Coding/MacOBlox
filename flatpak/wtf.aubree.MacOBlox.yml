@@ -1,4 +1,4 @@
-app-id: xyz.narez.MacOBlox
+app-id: wtf.aubree.MacOBlox
 runtime: org.gnome.Platform
 runtime-version: '50'
 sdk: org.gnome.Sdk
@@ -47,18 +47,18 @@ modules:
       - python3 -m compileall -q -d /app/share/macoblox/launcher /app/share/macoblox/launcher
       - install -Dm755 flatpak/macoblox.sh /app/bin/macoblox
       - for size in 16 22 24 32 48 64 128 256 512; do install -Dm644 branding/icons/macoblox-$size.png
-        /app/share/icons/hicolor/${size}x${size}/apps/xyz.narez.MacOBlox.png; done
+        /app/share/icons/hicolor/${size}x${size}/apps/wtf.aubree.MacOBlox.png; done
       # Also as "macoblox", the name the launcher gives its windows (only
       # app-ID icons are exported to the host; this one stays inside).
       - for size in 16 22 24 32 48 64 128 256 512; do install -Dm644 branding/icons/macoblox-$size.png
         /app/share/icons/hicolor/${size}x${size}/apps/macoblox.png; done
       - install -d /app/share/applications
-      - sed 's/^Icon=.*/Icon=xyz.narez.MacOBlox/' packaging/xyz.narez.MacOBlox.desktop
-        > /app/share/applications/xyz.narez.MacOBlox.desktop
+      - sed 's/^Icon=.*/Icon=wtf.aubree.MacOBlox/' packaging/wtf.aubree.MacOBlox.desktop
+        > /app/share/applications/wtf.aubree.MacOBlox.desktop
       # The Roblox window's own entry, so docks show its icon.
-      - sed 's/^Icon=.*/Icon=xyz.narez.MacOBlox/' packaging/macoblox-roblox-window.desktop
-        > /app/share/applications/xyz.narez.MacOBlox.RobloxWindow.desktop
-      - install -Dm644 flatpak/xyz.narez.MacOBlox.metainfo.xml -t /app/share/metainfo
+      - sed 's/^Icon=.*/Icon=wtf.aubree.MacOBlox/' packaging/macoblox-roblox-window.desktop
+        > /app/share/applications/wtf.aubree.MacOBlox.RobloxWindow.desktop
+      - install -Dm644 flatpak/wtf.aubree.MacOBlox.metainfo.xml -t /app/share/metainfo
     sources:
       - type: dir
         path: ..
