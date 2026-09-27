@@ -1199,6 +1199,24 @@ class RobloxSession:
             self.process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
                                             stdout=log, stderr=subprocess.STDOUT,
                                             start_new_session=True)
+        self.started_at = time.time()
+        threading.Thread(target=self._suppress_crash_handler, daemon=True).start()
+
+    def _suppress_crash_handler(self):
+        """Terminate RobloxCrashHandler after initial handshake to prevent exit hangs and slow crash logs."""
+        for _ in range(20):
+            time.sleep(1)
+            if not self.process or self.process.poll() is not None:
+                return
+            crash_pids = roblox_pids(("RobloxCrashHandler",))
+            if crash_pids:
+                time.sleep(2)
+                for pid in roblox_pids(("RobloxCrashHandler",)):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                break
 
     def poll(self):
         """None while running, otherwise the exit status (or -1 if unknown)."""
@@ -1208,12 +1226,20 @@ class RobloxSession:
             return status
         if self.audio:
             self.audio.keep_playing()
+        # Suppress any crash handler to prevent slow dumps and exit blockage
+        if self.seen_roblox and time.time() - self.started_at > 3:
+            for pid in roblox_pids(("RobloxCrashHandler",)):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
         # darling shell can outlive a Roblox that was killed; watch the game
         # processes themselves as well. Known ones are checked each second,
         # the whole of /proc only when they are gone or every few seconds.
         now = time.time()
         self.game_pids = [pid for pid in self.game_pids if _process_state(pid) not in (None, "Z")]
-        if not self.game_pids or now - self.scanned_at > 2:
+        if not self.game_pids or now - self.scanned_at > 1:
             self.game_pids = roblox_pids(("RobloxPlayer",))
             self.scanned_at = now
         if self.game_pids:
@@ -1221,7 +1247,7 @@ class RobloxSession:
             self.gone_since = None
         elif self.seen_roblox:
             self.gone_since = self.gone_since or time.time()
-            if time.time() - self.gone_since > 1.5:
+            if time.time() - self.gone_since > 0.5:
                 self.finish()
                 return -1
         return None
