@@ -134,11 +134,6 @@ class PlayPage(Adw.Bin):
         self.playtime_box.set_tooltip_text(_("Total playtime"))
         action_bar.pack_start(self.playtime_box)
 
-        version = Gtk.Label(label=f"Mac O’ Blox {__version__}")
-        version.add_css_class("dim-label")
-        version.add_css_class("caption")
-        action_bar.pack_start(version)
-
         self.studio_progress = Gtk.ProgressBar(show_text=True, visible=False)
         self.studio_progress.set_size_request(160, -1)
         action_bar.pack_start(self.studio_progress)
@@ -1422,6 +1417,8 @@ class LauncherWindow(Adw.ApplicationWindow):
         sidebar_toolbar = Adw.ToolbarView()
         sidebar_header = Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False)
         sidebar_header.set_title_widget(Gtk.Label(label="Mac O’ Blox", css_classes=["heading"]))
+        sidebar_version = Gtk.Label(label=f"v{__version__}", css_classes=["dim-label", "caption"], margin_end=6)
+        sidebar_header.pack_end(sidebar_version)
         sidebar_toolbar.add_top_bar(sidebar_header)
 
         sidebar_toolbar.set_content(_page_sidebar(self.stack))

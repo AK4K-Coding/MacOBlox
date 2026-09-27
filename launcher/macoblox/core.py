@@ -1213,27 +1213,30 @@ class RobloxSession:
         # the whole of /proc only when they are gone or every few seconds.
         now = time.time()
         self.game_pids = [pid for pid in self.game_pids if _process_state(pid) not in (None, "Z")]
-        if not self.game_pids or now - self.scanned_at > 5:
-            self.game_pids = roblox_pids()
+        if not self.game_pids or now - self.scanned_at > 2:
+            self.game_pids = roblox_pids(("RobloxPlayer",))
             self.scanned_at = now
         if self.game_pids:
             self.seen_roblox = True
             self.gone_since = None
         elif self.seen_roblox:
             self.gone_since = self.gone_since or time.time()
-            if time.time() - self.gone_since > 6:
+            if time.time() - self.gone_since > 1.5:
                 self.finish()
                 return -1
         return None
 
     def finish(self):
+        leftover = roblox_pids()
+        if leftover:
+            _terminate(leftover, wait=1)
         if self.process and self.process.poll() is None:
             # Roblox is gone but `darling shell` stayed: end it (it leads its
             # own process group) instead of leaving it behind.
             for sig in (signal.SIGTERM, signal.SIGKILL):
                 try:
                     os.killpg(self.process.pid, sig)
-                    self.process.wait(timeout=3)
+                    self.process.wait(timeout=2)
                     break
                 except (OSError, subprocess.TimeoutExpired):
                     pass
