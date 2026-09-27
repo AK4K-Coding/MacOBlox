@@ -445,6 +445,27 @@ class SettingsPage(Adw.Bin):
         # 1. Environment page (Interface, Game, DNS, Diagnostics)
         self.env_page = Adw.PreferencesPage()
 
+        launcher_group = Adw.PreferencesGroup(title="Mac O’ Blox")
+        self.launcher_version_row = Adw.ActionRow(
+            title=_("Launcher version"),
+            subtitle=f"v{__version__}"
+        )
+        self.check_launcher_btn = Gtk.Button(label=_("Check for updates"), valign=Gtk.Align.CENTER)
+        self._launcher_update_handler = self.check_launcher_btn.connect(
+            "clicked", lambda *_args: self.check_launcher_update()
+        )
+        self.launcher_version_row.add_suffix(self.check_launcher_btn)
+        launcher_group.add(self.launcher_version_row)
+
+        force_update = _button_row(_("Force update"))
+        force_update.connect("activated", lambda *_args: self.force_update_launcher())
+        launcher_group.add(force_update)
+
+        self.launcher_progress = Gtk.ProgressBar(show_text=True, margin_top=6, margin_bottom=6,
+                                                 margin_start=12, margin_end=12, visible=False)
+        launcher_group.add(Gtk.ListBoxRow(activatable=False, selectable=False, child=self.launcher_progress))
+        self.env_page.add(launcher_group)
+
         interface = Adw.PreferencesGroup(title=_("Interface"))
         codes = list(i18n.LANGUAGES)
         language = Adw.ComboRow(title=_("Language"),
@@ -606,6 +627,58 @@ class SettingsPage(Adw.Bin):
         self.update_button.set_label(label)
         self.update_button.disconnect(self._update_handler)
         self._update_handler = self.update_button.connect("clicked", lambda *_args: action())
+
+    def check_launcher_update(self):
+        self.check_launcher_btn.set_sensitive(False)
+        self.check_launcher_btn.set_label(_("Checking…"))
+
+        def done(result, error):
+            self.check_launcher_btn.set_sensitive(True)
+            if error:
+                self.check_launcher_btn.set_label(_("Check for updates"))
+                _toast(self.window.toasts, _("Could not check: {error}", error=error))
+                return
+            has_update, tag, html_url = result
+            if has_update:
+                self.launcher_version_row.set_subtitle(_("Update {version} available", version=tag))
+                self.check_launcher_btn.set_label(_("Update to {version}", version=tag))
+                self.check_launcher_btn.disconnect(self._launcher_update_handler)
+                self._launcher_update_handler = self.check_launcher_btn.connect(
+                    "clicked", lambda *_args: self.force_update_launcher()
+                )
+                _toast(self.window.toasts, _("Update {version} available", version=tag))
+            else:
+                self.check_launcher_btn.set_label(_("Check for updates"))
+                _toast(self.window.toasts, _("Mac O’ Blox is up to date"))
+
+        self._in_thread(core.check_launcher_update, done)
+
+    def force_update_launcher(self):
+        if not self.window.begin("updating_launcher"):
+            return
+        self.check_launcher_btn.set_sensitive(False)
+        self.launcher_progress.set_visible(True)
+        self.launcher_progress.set_fraction(0.1)
+        self.launcher_progress.set_text(_("Updating…"))
+
+        def progress(fraction, text):
+            GLib.idle_add(self.launcher_progress.set_fraction, fraction)
+            GLib.idle_add(self.launcher_progress.set_text, text)
+
+        def done(result, error):
+            self.window.end()
+            self.check_launcher_btn.set_sensitive(True)
+            self.launcher_progress.set_visible(False)
+            if error:
+                _error_dialog(self.window, _("Update failed"), str(error) or repr(error))
+                return
+            ok, msg = result if result else (False, "")
+            if ok:
+                _toast(self.window.toasts, msg)
+            else:
+                _open_uri(self.window, msg)
+
+        self._in_thread(lambda: core.update_launcher(progress), done)
 
     def check_updates(self, install=False):
         """Looks for a newer client; with install=True also installs it
@@ -825,6 +898,7 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.last_log = None
         # MACOBLOX_PAGE opens another tab first (for screenshots).
         self.build(os.environ.get("MACOBLOX_PAGE", "play"))
+        threading.Thread(target=self._check_startup_update, daemon=True).start()
 
     def build(self, page):
         """(Re)create the interface, e.g. after the language changes."""
@@ -887,6 +961,32 @@ class LauncherWindow(Adw.ApplicationWindow):
         show = not self.split.get_show_sidebar()
         self.split.set_show_sidebar(show)
         self.set_setting("show_sidebar", show)
+
+    def _check_startup_update(self):
+        try:
+            has_update, tag, html_url = core.check_launcher_update()
+            if has_update:
+                GLib.idle_add(self._show_launcher_update_dialog, tag)
+        except Exception:
+            pass
+
+    def _show_launcher_update_dialog(self, tag):
+        dialog = Adw.AlertDialog(
+            heading=_("Update available"),
+            body=_("A new version of Mac O’ Blox ({version}) is available. Update now?", version=tag)
+        )
+        dialog.add_response("later", _("Later"))
+        dialog.add_response("update", _("Update"))
+        dialog.set_response_appearance("update", Adw.ResponseAppearance.SUGGESTED)
+
+        def response(_dialog, result):
+            if result == "update":
+                self.stack.set_visible_child_name("settings")
+                self.settings_page.set_tab("env")
+                self.settings_page.force_update_launcher()
+
+        dialog.connect("response", response)
+        dialog.present(self)
 
     def begin(self, what):
         """Claim the launcher for one long operation; False, with a message,

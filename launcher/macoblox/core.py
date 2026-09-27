@@ -221,9 +221,67 @@ def installed_version():
 def latest_version():
     """Returns (version, clientVersionUpload) from Roblox's version service."""
     request = urllib.request.Request(VERSION_URL, headers={"User-Agent": "MacOBlox"})
-    with urllib.request.urlopen(request, timeout=15) as response:
+    with urllib.request.urlopen(request, timeout=10) as response:
         data = json.load(response)
     return data["version"], data["clientVersionUpload"]
+
+
+LAUNCHER_RELEASE_URL = "https://api.github.com/repos/aubree-lat/MacOBlox/releases/latest"
+
+
+def parse_version_tuple(ver):
+    return tuple(int(x) for x in re.findall(r"\d+", ver)) if ver else (0,)
+
+
+def check_launcher_update():
+    """Checks GitHub for a newer release of Mac O’ Blox.
+    Returns (has_update, latest_version_string, release_url)."""
+    req = urllib.request.Request(LAUNCHER_RELEASE_URL, headers={"User-Agent": "MacOBlox"})
+    try:
+        with urllib.request.urlopen(req, timeout=6) as response:
+            data = json.loads(response.read().decode())
+        tag = data.get("tag_name", "").lstrip("v")
+        html_url = data.get("html_url", "https://github.com/aubree-lat/MacOBlox/releases")
+        has_update = parse_version_tuple(tag) > parse_version_tuple(__version__)
+        return has_update, tag, html_url
+    except Exception as error:
+        return False, None, str(error)
+
+
+def update_launcher(progress=None):
+    """Updates Mac O’ Blox: pulls latest commits if git repo, rebuilds shim,
+    and runs launcher/install.sh."""
+    if progress:
+        progress(0.2, _("Pulling latest version…"))
+
+    is_git = (PROJECT / ".git").is_dir()
+    if is_git:
+        proc = subprocess.run(["git", "pull", "--ff-only"], cwd=str(PROJECT),
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            proc = subprocess.run(["git", "pull"], cwd=str(PROJECT),
+                                  capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
+    else:
+        return False, "https://github.com/aubree-lat/MacOBlox/releases/latest"
+
+    if progress:
+        progress(0.6, _("Building shim…"))
+    ok, output = build_shim()
+    if not ok:
+        raise RuntimeError(_("Could not build the shim:\n{output}", output=output))
+
+    if progress:
+        progress(0.9, _("Updating launcher shortcuts…"))
+    install_script = PROJECT / "launcher" / "install.sh"
+    if install_script.exists():
+        subprocess.run([str(install_script)], cwd=str(PROJECT), check=True)
+
+    if progress:
+        progress(1.0, _("Mac O’ Blox updated successfully"))
+
+    return True, _("Mac O’ Blox updated successfully")
 
 
 def update_roblox(upload, progress=None):

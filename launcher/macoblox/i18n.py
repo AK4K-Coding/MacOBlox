@@ -15,6 +15,20 @@ RU = {
     "Collapse sidebar": "Свернуть панель",
     "Expand sidebar": "Развернуть панель",
     "Toggle sidebar": "Свернуть/развернуть панель",
+    # Launcher update
+    "Update available": "Доступно обновление",
+    "A new version of Mac O’ Blox ({version}) is available. Update now?":
+        "Доступна новая версия Mac O’ Blox ({version}). Обновить сейчас?",
+    "Later": "Позже",
+    "Update": "Обновить",
+    "Launcher version": "Версия лаунчера",
+    "Force update": "Принудительное обновление",
+    "Mac O’ Blox is up to date": "Установлена последняя версия Mac O’ Blox",
+    "Update {version} available": "Доступно обновление {version}",
+    "Pulling latest version…": "Загрузка последней версии…",
+    "Building shim…": "Сборка шима…",
+    "Updating launcher shortcuts…": "Обновление ярлыков лаунчера…",
+    "Mac O’ Blox updated successfully": "Mac O’ Blox успешно обновлён",
     # Play page
     "Roblox {version}": "Roblox {version}",
     "Roblox not found": "Roblox не найден",
