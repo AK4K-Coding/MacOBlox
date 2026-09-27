@@ -7,6 +7,7 @@
 
 <p align="center">
   The real macOS Roblox client, running on Linux through <a href="https://www.darlinghq.org">Darling</a>.
+  improved by aubree.wtf with patches and more, originally created by narizy, credits to them.
 </p>
 
 <p align="center">
