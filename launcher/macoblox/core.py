@@ -88,6 +88,14 @@ DEFAULT_SETTINGS = {
     "keep_logs": 30,
     "show_sidebar": True,
     "framerate_cap": 0,
+    "auto_check_roblox_updates": True,
+    "mod_death_sound": "default",
+    "mod_custom_death_sound": "",
+    "mod_old_character_sounds": False,
+    "mod_cursor_type": "default",
+    "mod_custom_cursor": "",
+    "mod_custom_font": "",
+    "enable_custom_mods": True,
 }
 
 # Settings -> environment variables understood by the shim.
@@ -319,6 +327,18 @@ def update_roblox(upload, progress=None):
     if progress:
         progress(1.0, _("Done"))
     return backup if had_bundle else None
+
+
+def delete_roblox():
+    """Completely delete the local RobloxPlayer.app bundle and any mod backups."""
+    if APP_BUNDLE.exists():
+        if APP_BUNDLE.is_dir():
+            shutil.rmtree(APP_BUNDLE, ignore_errors=True)
+        else:
+            APP_BUNDLE.unlink(missing_ok=True)
+    mods_backup = DATA_DIR / "mods_backup"
+    if mods_backup.exists() and mods_backup.is_dir():
+        shutil.rmtree(mods_backup, ignore_errors=True)
 
 
 # ----------------------------------------------------------------- processes
@@ -1127,6 +1147,11 @@ class RobloxSession:
             _terminate(leftover, wait=3)
         orphans = clear_orphaned_darling()
         prepare_prefix(env)
+        try:
+            from . import mods
+            mods.apply_mods(self.settings)
+        except Exception as e:
+            logging.getLogger("macoblox").warning("Failed to apply mods: %s", e)
         provider = self.settings.get("dns", "system")
         if provider != "system" and (provider != "custom" or self.settings.get("dns_custom")):
             from .dns import DnsForwarder
