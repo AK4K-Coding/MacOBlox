@@ -62,6 +62,11 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.14" date="2026-09-26">
+      <description>
+        <p>Fixes for freezes, stutter, audio dropouts and slow loading, and the Roblox sign-in cookie is only sent to Roblox.</p>
+      </description>
+    </release>
     <release version="0.13" date="2026-09-24"/>
   </releases>
 </component>
