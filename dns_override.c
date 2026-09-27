@@ -13,7 +13,6 @@
  * freeaddrinfo() frees it. The forwarder answers SERVFAIL when its server
  * cannot be reached; when it does not answer at all, it is skipped for 30 s
  * instead of costing every lookup the 5 s wait. */
-
 typedef unsigned int socklen_t;
 typedef long ssize_t;
 typedef unsigned long size_t;
@@ -32,7 +31,6 @@ struct darwin_addrinfo {
     struct darwin_addrinfo *next;
 };
 struct darwin_pollfd { int fd; short events, revents; };
-
 extern char *getenv(const char *);
 extern int socket(int, int, int);
 extern int connect(int, const void *, socklen_t);
@@ -45,7 +43,6 @@ extern void *calloc(size_t, size_t);
 extern void free(void *);
 extern char *strdup(const char *);
 extern unsigned long long mach_absolute_time(void);
-
 #define AF_INET_DARWIN 2
 #define EAI_NONAME_DARWIN 8
 #define MAX_ADDRESSES 16
@@ -54,10 +51,8 @@ extern unsigned long long mach_absolute_time(void);
 #define FD_CLOEXEC_DARWIN 1
 #define FORWARDER_WAIT_MS 2500
 #define FORWARDER_SKIP_NS 30000000000ULL
-
 /* After a forwarder that did not answer at all: skip it until then. */
 static volatile unsigned long long forwarder_skipped_until;
-
 static int forwarder_port(unsigned int *address, unsigned short *port) {
     const char *value = getenv("MACOBLOX_DNS");
     if (!value || !value[0])
@@ -73,6 +68,8 @@ static int forwarder_port(unsigned int *address, unsigned short *port) {
             number = 0;
         } else if (*c >= '0' && *c <= '9') {
             number = number * 10 + (unsigned int)(*c - '0');
+            if (number > 255)
+                return 0;
         } else {
             return 0;
         }
@@ -85,11 +82,11 @@ static int forwarder_port(unsigned int *address, unsigned short *port) {
         number = number * 10 + (unsigned int)(*c - '0');
     if (!number || number > 65535)
         return 0;
-    *address = parts[0] | parts[1] << 8 | parts[2] << 16 | parts[3] << 24; /* network order */
+    /* LE-friendly packing: produces correct network-order bytes in memory. */
+    *address = parts[0] | parts[1] << 8 | parts[2] << 16 | parts[3] << 24;
     *port = (unsigned short)((number >> 8) | ((number & 255) << 8));
     return 1;
 }
-
 static int is_ip_literal(const char *node) {
     int digits_and_dots = 1;
     for (const char *c = node; *c; c++) {
@@ -100,7 +97,6 @@ static int is_ip_literal(const char *node) {
     }
     return digits_and_dots;
 }
-
 static int parse_port(const char *service, unsigned short *port) {
     unsigned int number = 0;
     if (!service) {
@@ -119,20 +115,25 @@ static int parse_port(const char *service, unsigned short *port) {
     *port = (unsigned short)((number >> 8) | ((number & 255) << 8));
     return 1;
 }
-
 /* Skip a possibly compressed DNS name; returns the offset after it or -1. */
 static int skip_name(const unsigned char *packet, int length, int offset) {
+    int jumps = 0;
     while (offset < length) {
         unsigned char label = packet[offset];
         if (label == 0)
             return offset + 1;
-        if ((label & 0xC0) == 0xC0)
+        if ((label & 0xC0) == 0xC0) {
+            /* compression pointer — do not follow, just skip the two bytes */
             return offset + 2 <= length ? offset + 2 : -1;
+        }
+        if ((label & 0xC0) != 0)
+            return -1; /* reserved bits */
         offset += label + 1;
+        if (++jumps > 128)
+            return -1;
     }
     return -1;
 }
-
 /* Returns the number of A records found, 0 for none, -1 on failure, and -2
  * for NXDOMAIN. */
 static int query_forwarder(const char *node, unsigned int *addresses) {
@@ -166,7 +167,6 @@ static int query_forwarder(const char *node, unsigned int *addresses) {
     query[length++] = 0;
     query[length++] = 0; query[length++] = 1; /* type A */
     query[length++] = 0; query[length++] = 1; /* class IN */
-
     int fd = socket(AF_INET_DARWIN, 2 /* SOCK_DGRAM */, 0);
     if (fd < 0)
         return -1;
@@ -186,6 +186,9 @@ static int query_forwarder(const char *node, unsigned int *addresses) {
             ssize_t got = recv(fd, reply, sizeof reply, 0);
             if (got < 12 || reply[0] != query[0] || reply[1] != query[1])
                 continue;
+            /* Require a response (QR=1) and opcode 0. */
+            if ((reply[2] & 0x80) == 0 || (reply[2] & 0x78) != 0)
+                continue;
             int rcode = reply[3] & 15;
             if (rcode == 3) {
                 found = -2;
@@ -197,7 +200,7 @@ static int query_forwarder(const char *node, unsigned int *addresses) {
             int offset = skip_name(reply, (int)got, 12);
             if (offset < 0)
                 break;
-            offset += 4;
+            offset += 4; /* type + class of the question */
             found = 0;
             for (int i = 0; i < answers && offset >= 0 && offset + 10 <= got; i++) {
                 offset = skip_name(reply, (int)got, offset);
@@ -208,11 +211,13 @@ static int query_forwarder(const char *node, unsigned int *addresses) {
                 offset += 10;
                 if (offset + data_length > got)
                     break;
-                if (type == 1 && data_length == 4 && found < MAX_ADDRESSES)
+                if (type == 1 && data_length == 4 && found < MAX_ADDRESSES) {
+                    /* Same LE-friendly packing used by forwarder_port. */
                     addresses[found++] = (unsigned int)reply[offset] |
                                          (unsigned int)reply[offset + 1] << 8 |
                                          (unsigned int)reply[offset + 2] << 16 |
                                          (unsigned int)reply[offset + 3] << 24;
+                }
                 offset += data_length;
             }
         }
@@ -222,7 +227,16 @@ static int query_forwarder(const char *node, unsigned int *addresses) {
         forwarder_skipped_until = mach_absolute_time() + FORWARDER_SKIP_NS;
     return found;
 }
-
+/* Free a partial list we built (Darling freeaddrinfo expects the same shape). */
+static void free_partial(struct darwin_addrinfo *head) {
+    while (head) {
+        struct darwin_addrinfo *next = head->next;
+        free(head->addr);
+        free(head->canonname);
+        free(head);
+        head = next;
+    }
+}
 /* 0 on success with *result set, an EAI error, or -1 to use the system resolver. */
 int macoblox_dns_resolve(const char *node, const char *service, const void *hints_pointer,
                          void **result) {
@@ -240,14 +254,12 @@ int macoblox_dns_resolve(const char *node, const char *service, const void *hint
         if (local[i] != node[i]) { is_local = 0; break; }
     if (is_local)
         return -1;
-
     unsigned int addresses[MAX_ADDRESSES];
     int count = query_forwarder(node, addresses);
     if (count == -2)
         return EAI_NONAME_DARWIN;
     if (count <= 0)
         return -1;
-
     int socktypes[2] = {1 /* STREAM */, 2 /* DGRAM */};
     int protocols[2] = {6, 17};
     int kinds = 2;
@@ -265,7 +277,8 @@ int macoblox_dns_resolve(const char *node, const char *service, const void *hint
             struct darwin_sockaddr_in *address = entry ? calloc(1, sizeof *address) : 0;
             if (!address) {
                 free(entry);
-                break;
+                free_partial(head);
+                return -1;
             }
             address->len = sizeof *address;
             address->family = AF_INET_DARWIN;
@@ -282,8 +295,10 @@ int macoblox_dns_resolve(const char *node, const char *service, const void *hint
     }
     if (!head)
         return -1;
-    if (hints && (hints->flags & AI_CANONNAME_DARWIN))
+    if (hints && (hints->flags & AI_CANONNAME_DARWIN)) {
         head->canonname = strdup(node); /* no CNAME is followed here */
+        /* strdup failure is acceptable; leave canonname NULL */
+    }
     *result = head;
     return 0;
 }

@@ -55,6 +55,7 @@ cd MacOBlox
 ./run_debug.sh
 ```
 
+<<<<<<< patch-1
 The script compiles the library from `libMacOBloxShims.m` in `build/`, launches
 the client from the project folder within an existing Darling prefix, and writes
 the output to a separate file in `logs/launch-*.log`. Arguments are passed to the client.
@@ -166,6 +167,169 @@ In `ffmpeg_compat/`, there are links between different ABI versions; compatibili
 has not been verified, and the new build does not add this folder to the library path.
 
 Accessing host files via `/Volumes/SystemRoot` is described in the documentation:
+=======
+The script builds the library from `libMacOBloxShims.m` in `build/`, launches
+the client from the project folder within an existing Darling prefix, and writes
+the output to a separate file in `logs/launch-*.log`. Arguments are passed to the client.
+The launch itself requires a running Darling outside the restricted Codex environment.
+The launch script has not yet been tested in a running Darling instance.
+
+Build only: `./build_debug_shim.sh`. You can set `DARLING_SYSROOT`.
+The old libraries in the root directory and inside `.app` are preserved; the new one is selected
+via `DYLD_INSERT_LIBRARIES` and `DYLD_LIBRARY_PATH`.
+
+## Changes 2026-09-21
+
+- Fixed the signature for intercepting `NSWindow initWithContentRect:…`:
+  the rectangle is passed by value, and the flag uses the x86_64 BOOL ABI.
+  Signature: https://developer.apple.com/documentation/appkit/nswindow/init(contentrect:stylemask:backing:defer:)
+- Removed the call to the assumed `what()` method for arbitrary C++ exceptions.
+  A discarded object does not necessarily have a virtual function table.
+- Separate scripts for building and diagnostic runs have been added.
+- The source code and old library are stored in `backups/before-codex-20260921/`.
+- Cross-compilation was successful; shell script syntax has been verified.
+- The Codex environment launch test stops in Darling before Roblox starts:
+  `binary is not setuid root, which is mandatory`. In this environment, the owner
+  of the system binary is listed as nobody. This does not prove that the
+  installation on the host is broken and is not a reason to change system permissions.
+
+## Changes 2026-09-26
+
+Verified using a test suite under Darling (network, mutexes, waits, sound,
+cookies); the old build fails the new tests, while the new one passes them all.
+
+- Timeout waits in Darling return 0 instead of ETIMEDOUT (100 ms
+  wait — 0 after 100 ms). Therefore, the wait intervals in `darling_fixes.c`
+  never increased (each 50-ms interval — a request to darlingserver), and
+  the caller never saw a timeout. Now, the elapsed time is determined by the clock;
+  for `pthread_cond_timedwait_relative_np` (which Roblox imports), the time
+  of segments already waited out is subtracted; otherwise, waits longer than a second
+  would never end.
+- kqueue: Roblox closes sockets using `close$NOCANCEL` without EV_DELETE, and
+  the socket entry remained: the next socket with the same number received
+  events from the old owner (the thread loops, a use-after-free is possible in
+  Asio). `close`/`close$NOCANCEL` have been intercepted; entries are checked against the inode.
+- The “is there data” check is now done via `poll` instead of `recv(MSG_PEEK)`:
+  any receive operation, even a peek, triggers a socket error (ICMP “port unreachable”),
+  and after that, `recv(MSG_DONTWAIT)` on a blocking socket would hang indefinitely.
+- UDP watchdog ping—only for network sockets (AF_INET/AF_INET6), not for
+  local pairs where threads wake each other up; a thread waiting on a mutex
+  is checked again before the ping.
+- Cookies: `cookiesForURL:` Darling ignores the URL, and `setCookies:forURL:…`
+  does nothing. Storage is now managed internally: domain, path, Secure, and expiration
+  are checked (login credentials no longer leak to third-party hosts or via HTTP), the new
+  value replaces the old one, file writing is atomic, set to 0600 immediately; session
+  cookies are in memory only; a foreign domain in Set-Cookie is rejected.
+- Event queue: “no event” — type 100, same as in Darling (NSApplication
+  compares it to 0x64). Type 13 was a real event at point (0,0).
+- Keys: On FocusOut, the table of pressed keys is reset (Alt+Tab with
+  W held down no longer leaves it “pressed” for CGEventSourceKeyState).
+- Mouse capture: while our warp is running, movement events are not merged; if
+  movement from the warp never arrives, centering resumes after 8
+  events (previously it was disabled until the end of capture).
+- The XFixes stream sleeps on the pipe instead of polling every 5 ms via usleep
+  Darling (400 requests to darlingserver per second); it starts at launch.
+- getaddrinfo: pause between attempts without blocking, retry only in case of
+  temporary errors, waiting via direct Linux sleeps.
+- Exception handlers, `makeCurrentContext`, `flushBuffer`: `getenv` and `dlsym` are called once,
+  rather than for every `throw` or frame (Lua errors in games are C++ exceptions).
+- Shaders: the Mesa fix applies to all shaders (not just the
+  first 8192); source code is stored only with `MACOBLOX_TRACE_GL=1`.
+- `fast_libc.c`: SSE loops instead of `rep movsb/stosb` where those are slower
+  (short copies, 4K aliasing, more L2), fast memchr/strlen/strcmp,
+  memset_pattern4/8/16 have been reimplemented.
+- `MACOBLOX_*=0` flags now mean “disabled.”
+
+## Changes September 26, 2026, evening: locks without darlingserver
+
+- In Darling, mutexes and conditional variables (psynch) are waited on via
+  darlingserver: every capture under load, every wait, and every signal is
+  a request to the server (40% of the game’s CPU usage); wake-ups are lost, and conditional
+  variables break (the timeout arrives as a wake-up, the counters
+  diverging, followed by “psync_cvwait; invalid sequence numbers” and EINVAL on
+  every wait—12,874 times in 7 minutes in the server log).
+- Now, in `darling_fixes.c`, a busy mutex waits on a Linux futex (the table
+  at the mutex’s address, woken by `pthread_mutex_unlock`), while the condition variables
+  are separate: a queue of waiters, each with its own futex; a signal wakes exactly one,
+  a broadcast wakes exactly the number of waiters, and process signals do not interrupt the wait.
+  Conditional variables created by Darling itself (tag ‘COND’/0x434F4E45,
+  process-shared) remain its own. “Queue” test: 13.6 s and 18.5 s CPU
+  darlingserver → 0.13 s and 0.04 s.
+- `PTHREAD_MUTEX_USE_ULOCK=1` (libpthread mode using ulock) is not suitable:
+  its condition variables call `__ulock_wait2` (syscall 544), which is not
+  present in Darling—the process crashes on the first wait.
+- Launcher: “Restart Darling” stops the entire container (launchd and
+  daemons—which are not children of darlingserver and remained orphaned with ~250 MB), and upon
+  startup, it terminates Darling processes without a running server and waits until
+  the previous game closes (otherwise, both would share the same server and crash together).
+
+## Changes 2026-09-27
+
+- New launcher interface (PR #1 by TinyTosha) with refinements: a sidebar
+  with a fallback option for libadwaita < 1.9, an FPS limit as a launcher setting
+  (the launch script writes FramerateCap to GlobalBasicSettings_13.xml already inside
+  Darling before the game starts), and launcher updates are now fast-forward only.
+- Thread stacks (`darling_fixes.c`): Darling allocates 512 KB to a thread if the creator
+  did not request more; the NVIDIA shader compiler used to overflow such a stack. Now
+  the minimum is 8 MB, as in Linux, including threads without attributes and GCD worker threads
+  (Darling creates them via `darling_thread_create` from the elfcalls table, which is
+  wrapped). GCD worker threads did not reset the stack upon reuse
+  (Darling jumps into `_start_wqthread` with the old stack pointer: +140 KB for
+  every 250 tasks); the `start_wqthread` pointer in `__common` libsystem_kernel
+  has been replaced with a jump that starts at the top of the stack.
+- `CGDisplayScreenSize` (`gpu_info.c`): Darling returned the size in pixels as
+  millimeters, and 0x0 for an unknown display ID; Roblox divides the width in pixels
+  by it without checking (DPI = infinity), which caused
+  infinite recursion in `updateSurfaceLuaApp` for a user on Fedora KDE. The size is now set to 96 DPI.
+- Embedded Roblox web pages (password login with CAPTCHA, purchases, links):
+  `web_bridge.m` replaces WKWebView with placeholders that use a Unix socket
+  (`MACOBLOX_WEB_SOCKET`, JSON line-by-line) to the launcher window running
+  WebKitGTK 6.0 (`launcher/macoblox/web.py`). Cookies are passed back and forth, so
+  the client remains logged in after signing in on the page. The protocol and some of the code are from the
+  spidercraft port (Roblox Mac Linux Port), with their permission. The replacement is applied only
+  when the launcher is listening on the socket; without WebKitGTK, everything works as before. Site data is stored in
+  `~/.config/macoblox/web`; clicking “Log Out” deletes it.
+- New application ID `wtf.aubree.MacOBlox` (Flatpak, .desktop, MIME, launcher,
+  packages); installers remove the old `xyz.narez.*` files. Version 0.15.
+- Microphone for voice chat (`audio_hal.c`): Roblox treats the AUHAL unit as
+  WebRTC—enables input on bus 1 (`kAudioOutputUnitProperty_EnableIO`),
+  sets the client format (scope 2, element 1, typically 48 kHz mono float32), and
+  the input callback (2005), within which `AudioUnitRender` retrieves frames.
+  The shim reads float32 from the second FIFO (`MACOBLOX_AUDIO_INPUT_FIFO`, in 10 ms blocks
+  into a ring buffer) and calls the callback for each block; `AudioUnitRender` on bus 1 outputs
+  frames in the client’s format (float32/int16, interleaved or not). Recording on the host
+  continues only as long as the game is listening: at startup, the shim writes the file `<fifo>.request`
+  (“frequency, channels”), and the launcher (`HostAudio._keep_recording`, once per tick
+  keep_playing) launches `pw-cat --record` (or `pacat`) with the Communication role;
+  when stopped, the file is deleted and recording ends. `AVCaptureDevice
+  authorizationStatusForMediaType:` and `requestAccessForMediaType:` (not present in Darling)
+  return “allowed.” Verified by a test client in Darling: 290 callbacks in
+  3 seconds, RMS 0.353 from a tone of 0.5 (0.354 was expected). In Darling, the process with the shim
+  crashes after returning from `main` (and in the build before the microphone as well)—a separate
+  exit issue that does not affect gameplay.
+- Flatpak: “Cannot determine your user name” on startup. `darling` retrieves the
+  username via `getpwuid(geteuid())`, and darling-noroot.so returns
+  euid 0; there is no root entry in the Flatpak sandbox’s /etc/passwd, and the fallback
+  `getlogin()` requires a loginuid, which some display managers do not set
+  (darling#715). Now `getpwuid(0)` in darling/darlingserver returns the entry
+  for the actual user.
+
+## What to Check Next
+
+We need a recent startup log from a regular terminal. This will help determine where
+the client is hanging: the loader, NIB loading, window creation, or rendering.
+According to the owner’s recollection, the engine used to start up, but there was no image;
+an old log confirming this has not yet been found.
+
+There are still potential issues in the old code: some fatal signals
+are suppressed, and the error handler manually parses the context and stack. These areas
+require separate verification. Cocoa string constants have been updated to NSString.
+`build_shims.py` is an old script that directly modifies the frameworks
+in `~/.darling`; the new scripts do not run it automatically.
+In `ffmpeg_compat/`, there are links between different ABI versions; compatibility
+has not been verified, and a new build does not add this folder to the library path.
+
+Accessing host files via `/Volumes/SystemRoot` is described in the documentation: 
 https://docs.darlinghq.org/internals/basics/containerization.html
 
 ## Blocker on the host after lifting Codex restrictions

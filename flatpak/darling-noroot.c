@@ -24,6 +24,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
+#include <pwd.h>
 #include <sched.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -68,6 +69,7 @@ DECLARE_REAL(seteuid);
 DECLARE_REAL(setegid);
 DECLARE_REAL(setresuid);
 DECLARE_REAL(setresgid);
+DECLARE_REAL(getpwuid);
 DECLARE_REAL(fchownat);
 DECLARE_REAL(chown);
 DECLARE_REAL(lchown);
@@ -118,6 +120,16 @@ int setresuid(uid_t r, uid_t e, uid_t s) {
 }
 int setresgid(gid_t r, gid_t e, gid_t s) {
     return current_role() == OTHER ? REAL(setresgid)(r, e, s) : 0;
+}
+
+/* `darling` names the home inside the prefix after the owner of its
+ * effective uid, which is root here. A Flatpak's /etc/passwd has no root
+ * entry, and the getlogin() fallback needs a login uid that some display
+ * managers never set: "Cannot determine your user name". Root is the user. */
+struct passwd *getpwuid(uid_t uid) {
+    if (current_role() != OTHER && uid == 0)
+        uid = REAL(getuid)();
+    return REAL(getpwuid)(uid);
 }
 
 /* The prefix is ours already; the copied macOS root would be chowned to
@@ -195,6 +207,7 @@ __attribute__((constructor(101))) static void resolve_real_functions(void) {
     RESOLVE(setegid);
     RESOLVE(setresuid);
     RESOLVE(setresgid);
+    RESOLVE(getpwuid);
     RESOLVE(fchownat);
     RESOLVE(chown);
     RESOLVE(lchown);

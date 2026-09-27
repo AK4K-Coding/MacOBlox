@@ -51,6 +51,7 @@ W OSStatus AudioDeviceDestroyIOProcID(UInt32, void *);
 W OSStatus AudioComponentInstanceDispose(void *);
 W OSStatus AudioUnitUninitialize(void *);
 W OSStatus AudioOutputUnitStop(void *);
+W OSStatus AudioUnitRender(void *, UInt32 *, const void *, UInt32, UInt32, BufferList *);
 extern void *calloc(unsigned long, unsigned long);
 extern void *malloc(unsigned long);
 extern void free(void *);
@@ -375,6 +376,18 @@ typedef struct {
     /* Read at start, not on the render thread (getenv races setenv). */
     char fifo_path[1024];
     long buffer_ms;
+    /* The microphone (bus 1), see unit_capture_thread. */
+    int input_enabled;
+    StreamDescription input_format; /* what AudioUnitRender delivers */
+    RenderProc input_callback;
+    void *input_context;
+    volatile int capturing;
+    void *capture_thread;
+    unsigned char *capture_ring; /* float32, interleaved */
+    unsigned long capture_ring_bytes;
+    volatile unsigned long capture_written, capture_read;
+    Float64 input_sample_time;
+    char input_fifo_path[1024];
 } OutputUnit;
 
 #define INVALID_PROPERTY (-10879)
@@ -785,7 +798,191 @@ static void unit_stop_producer(OutputUnit *unit) {
     }
 }
 
+/* The microphone (voice chat). Roblox's voice code drives an AUHAL unit the
+ * way WebRTC does: input enabled on bus 1, an input callback, and inside
+ * that callback AudioUnitRender pulls the captured frames. The launcher
+ * records with pw-cat into MACOBLOX_AUDIO_INPUT_FIFO as float32 at the
+ * rate and channel count the client asked for, but only while the request
+ * file next to the FIFO exists (written at start here, removed at stop, so
+ * the microphone is open only while the game listens). A thread reads
+ * 10 ms blocks into a ring and calls the client's input callback for each. */
+#define CAPTURE_RING_FRAMES 8192
+#define DARWIN_O_RDONLY 0x0
+#define DARWIN_O_CREAT 0x200
+#define DARWIN_O_TRUNC 0x400
+#define NO_CONNECTION (-10877) /* kAudioUnitErr_NoConnection */
+extern long read(int, void *, unsigned long);
+extern int unlink(const char *);
+
+static UInt32 capture_channels(OutputUnit *unit) {
+    UInt32 channels = unit->input_format.channels_per_frame;
+    return channels >= 1 && channels <= 2 ? channels : 1;
+}
+
+static Float64 capture_rate(OutputUnit *unit) {
+    Float64 rate = unit->input_format.sample_rate;
+    return rate >= 8000 && rate <= 192000 ? rate : 48000;
+}
+
+static void capture_request_path(OutputUnit *unit, char *out, unsigned long size) {
+    snprintf(out, size, "%s.request", unit->input_fifo_path);
+}
+
+static void *unit_capture_thread(void *context) {
+    OutputUnit *unit = context;
+    raise_render_priority();
+    UInt32 channels = capture_channels(unit);
+    UInt32 block_frames = (UInt32)(capture_rate(unit) / 100); /* 10 ms */
+    unsigned long block_bytes = (unsigned long)block_frames * channels * 4;
+    unsigned char *block = malloc(block_bytes);
+    unsigned long filled = 0;
+    int fd = -1;
+    TimeStamp stamp = {0};
+    while (block && unit->capturing) {
+        if (fd < 0) {
+            fd = open(unit->input_fifo_path, DARWIN_O_RDONLY | DARWIN_O_NONBLOCK);
+            if (fd < 0) {
+                macoblox_sleep_us(200000);
+                continue;
+            }
+        }
+        long n = read(fd, block + filled, block_bytes - filled);
+        if (n <= 0) { /* no recorder yet, or nothing new */
+            macoblox_sleep_us(5000);
+            continue;
+        }
+        filled += (unsigned long)n;
+        if (filled < block_bytes)
+            continue;
+        filled = 0;
+        unsigned long position = unit->capture_written % unit->capture_ring_bytes;
+        for (unsigned long i = 0; i < block_bytes; i++)
+            unit->capture_ring[(position + i) % unit->capture_ring_bytes] = block[i];
+        __sync_synchronize();
+        unit->capture_written += block_bytes;
+        if (unit->capture_written - unit->capture_read > unit->capture_ring_bytes)
+            unit->capture_read = unit->capture_written - unit->capture_ring_bytes; /* the oldest go */
+        stamp.sample_time = unit->input_sample_time;
+        stamp.host_time = mach_absolute_time();
+        stamp.flags = 0x3; /* sample time and host time valid */
+        UInt32 flags = 0;
+        if (unit->input_callback)
+            unit->input_callback(unit->input_context, &flags, &stamp, 1, block_frames, 0);
+        unit->input_sample_time += block_frames;
+    }
+    if (fd >= 0)
+        close(fd);
+    free(block);
+    return 0;
+}
+
+static int unit_start_capture(OutputUnit *unit) {
+    const char *fifo = getenv("MACOBLOX_AUDIO_INPUT_FIFO");
+    if (unit->capturing)
+        return 1;
+    if (!fifo || !fifo[0] || __builtin_strlen(fifo) + 16 >= sizeof unit->input_fifo_path)
+        return 0;
+    __builtin_memcpy(unit->input_fifo_path, fifo, __builtin_strlen(fifo) + 1);
+    UInt32 channels = capture_channels(unit);
+    unit->capture_ring_bytes = (unsigned long)CAPTURE_RING_FRAMES * channels * 4;
+    free(unit->capture_ring);
+    unit->capture_ring = calloc(1, unit->capture_ring_bytes);
+    if (!unit->capture_ring)
+        return 0;
+    unit->capture_written = unit->capture_read = 0;
+    unit->input_sample_time = 0;
+    char request[1100], text[64];
+    capture_request_path(unit, request, sizeof request);
+    int fd = open(request, DARWIN_O_WRONLY | DARWIN_O_CREAT | DARWIN_O_TRUNC, 0600);
+    if (fd >= 0) {
+        int length = snprintf(text, sizeof text, "%d %u\n", (int)capture_rate(unit), channels);
+        if (length > 0) write(fd, text, (unsigned long)length);
+        close(fd);
+    }
+    unit->capturing = 1;
+    unsigned char attributes[64] = {0}; /* pthread_attr_t is 64 bytes on Darwin x86_64 */
+    pthread_attr_init(attributes);
+    pthread_attr_setstacksize(attributes, 8u << 20);
+    if (pthread_create(&unit->capture_thread, attributes, unit_capture_thread, unit) != 0) {
+        unit->capturing = 0;
+        unlink(request);
+        return 0;
+    }
+    report("input unit: microphone capture started", 0, 0, 0, 0, 1);
+    return 1;
+}
+
+static void unit_stop_capture(OutputUnit *unit) {
+    if (!unit->capturing)
+        return;
+    unit->capturing = 0;
+    pthread_join(unit->capture_thread, 0);
+    char request[1100];
+    capture_request_path(unit, request, sizeof request);
+    unlink(request);
+    report("input unit: microphone capture stopped", 0, 0, 0, 0, 1);
+}
+
+/* AudioUnitRender on bus 1: the captured frames in the client's format. */
+static OSStatus unit_render_input(OutputUnit *unit, UInt32 frames, BufferList *list) {
+    if (!list || !list->count)
+        return NO_CONNECTION;
+    if (!unit->capturing)
+        return NO_CONNECTION;
+    const StreamDescription *format = &unit->input_format;
+    UInt32 channels = capture_channels(unit);
+    int non_interleaved = (format->format_flags & 0x20) != 0;
+    int is_float = (format->format_flags & 0x1) != 0 && format->bits_per_channel == 32;
+    int is_int16 = (format->format_flags & 0x4) != 0 && format->bits_per_channel == 16;
+    if (!is_float && !is_int16)
+        return -10868; /* kAudioUnitErr_FormatNotSupported */
+    UInt32 sample_bytes = is_float ? 4 : 2;
+    UInt32 per_buffer = non_interleaved ? 1 : channels;
+    for (UInt32 b = 0; b < list->count; b++) {
+        UInt32 capacity = list->buffers[b].byte_size / (sample_bytes * per_buffer);
+        if (!list->buffers[b].data || capacity < frames)
+            return -10851; /* kAudioUnitErr_InvalidPropertyValue: too small a buffer */
+    }
+    __sync_synchronize();
+    unsigned long available = (unit->capture_written - unit->capture_read) / (channels * 4);
+    UInt32 got = available < frames ? (UInt32)available : frames;
+    unsigned long position = unit->capture_read % unit->capture_ring_bytes;
+    for (UInt32 i = 0; i < frames; i++) {
+        for (UInt32 c = 0; c < channels; c++) {
+            float sample = 0;
+            if (i < got) {
+                unsigned char raw[4];
+                unsigned long at = position + ((unsigned long)i * channels + c) * 4;
+                for (int k = 0; k < 4; k++)
+                    raw[k] = unit->capture_ring[(at + k) % unit->capture_ring_bytes];
+                __builtin_memcpy(&sample, raw, 4);
+            }
+            Buffer *buffer = &list->buffers[non_interleaved ? (c < list->count ? c : list->count - 1) : 0];
+            unsigned long index = non_interleaved ? i : (unsigned long)i * channels + c;
+            if (is_float)
+                ((float *)buffer->data)[index] = sample;
+            else
+                ((short *)buffer->data)[index] =
+                    (short)((sample > 1 ? 1 : sample < -1 ? -1 : sample) * 32767);
+        }
+    }
+    for (UInt32 b = 0; b < list->count; b++)
+        list->buffers[b].byte_size = frames * sample_bytes * per_buffer;
+    unit->capture_read += (unsigned long)got * channels * 4;
+    return NO_ERROR;
+}
+
+static OSStatus t_render(void *instance, UInt32 *flags, const void *stamp, UInt32 element, UInt32 frames,
+                         BufferList *list) {
+    OutputUnit *unit = as_unit(instance);
+    if (!unit)
+        return AudioUnitRender(instance, flags, stamp, element, frames, list);
+    return element == 1 ? unit_render_input(unit, frames, list) : NO_CONNECTION;
+}
+DYLD_INTERPOSE(t_render, AudioUnitRender)
+
 static void unit_stop(OutputUnit *unit) {
+    unit_stop_capture(unit);
     unit_stop_producer(unit);
     if (unit->running && unit->ioproc)
         AudioDeviceStop(unit->device, unit->ioproc);
@@ -822,6 +1019,7 @@ static OSStatus t_new(void *component, void **instance) {
             unit->device = 2;
             unit->output_enabled = 1;
             unit->format = current_format;
+            unit->input_format = current_format;
             unit->max_frames = 4096;
             *instance = unit;
             report("AudioComponentInstanceNew (shim output unit)", 0, 0, 0, 0, 1);
@@ -841,6 +1039,7 @@ static OSStatus t_dispose(void *instance) {
         unit->magic = 0;
         free(unit->scratch);
         free(unit->ring);
+        free(unit->capture_ring);
         free(unit);
         return NO_ERROR;
     }
@@ -867,6 +1066,13 @@ static OSStatus unit_set(OutputUnit *unit, UInt32 id, UInt32 scope, UInt32 eleme
     case 2003: /* EnableIO */
         if (size >= 4 && scope == 2 && element == 0)
             unit->output_enabled = *(const UInt32 *)data != 0;
+        if (size >= 4 && scope == 1 && element == 1)
+            unit->input_enabled = *(const UInt32 *)data != 0;
+        return NO_ERROR;
+    case 2005: /* SetInputCallback */
+        if (size < 2 * sizeof(void *)) return BAD_SIZE;
+        unit->input_callback = ((RenderProc const *)data)[0];
+        unit->input_context = ((void *const *)data)[1];
         return NO_ERROR;
     case 2000: /* CurrentDevice */
         if (size < 4) return BAD_SIZE;
@@ -880,6 +1086,8 @@ static OSStatus unit_set(OutputUnit *unit, UInt32 id, UInt32 scope, UInt32 eleme
             return -10868; /* kAudioUnitErr_FormatNotSupported */
         if (scope == 1 && element == 0) /* what the client renders */
             unit->format = *format;
+        else if (scope == 2 && element == 1) /* what the client records */
+            unit->input_format = *format;
         return NO_ERROR;
     }
     case 23: /* SetRenderCallback */
@@ -895,18 +1103,18 @@ static OSStatus unit_set(OutputUnit *unit, UInt32 id, UInt32 scope, UInt32 eleme
 }
 
 static OSStatus unit_get(OutputUnit *unit, UInt32 id, UInt32 scope, UInt32 element, void *data, UInt32 *size) {
-    (void)element;
     switch (id) {
     case 8: /* StreamFormat: the client side and the device side use the same format */
-        return put(&unit->format, sizeof unit->format, size, data);
+        return put(element == 1 ? &unit->input_format : &unit->format, sizeof unit->format, size, data);
     case 2000:
         return put_u32(unit->device, size, data);
     case 2003:
-        return put_u32(scope == 2 ? (UInt32)unit->output_enabled : 0, size, data);
+        return put_u32(scope == 2 ? (UInt32)unit->output_enabled
+                                  : element == 1 ? (UInt32)unit->input_enabled : 0, size, data);
     case 2001: /* IsRunning */
-        return put_u32((UInt32)unit->running, size, data);
-    case 2006: /* HasIO */
-        return put_u32(scope == 2 ? 1 : 0, size, data);
+        return put_u32((UInt32)(unit->running || unit->capturing), size, data);
+    case 2006: /* HasIO: the output, and the microphone on bus 1 */
+        return put_u32(1, size, data);
     case 14:
         return put_u32(unit->max_frames, size, data);
     case 12: { /* Latency */
@@ -975,7 +1183,10 @@ static OSStatus t_start(void *instance) {
         report("AudioOutputUnitStart", 0, 0, status, 0, 0);
         return status;
     }
-    if (unit->running || !unit->output_enabled)
+    if (unit->input_enabled && unit->input_callback)
+        unit_start_capture(unit);
+    /* An input-only unit (voice chat) has no render callback: nothing to play. */
+    if (unit->running || !unit->output_enabled || !unit->render)
         return NO_ERROR;
     const char *fifo = getenv("MACOBLOX_AUDIO_FIFO");
     if (fifo && fifo[0] && __builtin_strlen(fifo) < sizeof unit->fifo_path) {
@@ -1042,6 +1253,7 @@ DYLD_INTERPOSE(t_start, AudioOutputUnitStart)
 static OSStatus t_stop(void *instance) {
     OutputUnit *unit = as_unit(instance);
     if (unit) {
+        unit_stop_capture(unit);
         unit_stop_producer(unit);
         if (unit->running && unit->ioproc)
             AudioDeviceStop(unit->device, unit->ioproc);

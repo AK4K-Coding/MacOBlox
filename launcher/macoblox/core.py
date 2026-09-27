@@ -88,6 +88,14 @@ DEFAULT_SETTINGS = {
     "keep_logs": 30,
     "show_sidebar": True,
     "framerate_cap": 0,
+    "auto_check_roblox_updates": True,
+    "mod_death_sound": "default",
+    "mod_custom_death_sound": "",
+    "mod_old_character_sounds": False,
+    "mod_cursor_type": "default",
+    "mod_custom_cursor": "",
+    "mod_custom_font": "",
+    "enable_custom_mods": True,
 }
 
 # Settings -> environment variables understood by the shim.
@@ -319,6 +327,18 @@ def update_roblox(upload, progress=None):
     if progress:
         progress(1.0, _("Done"))
     return backup if had_bundle else None
+
+
+def delete_roblox():
+    """Completely delete the local RobloxPlayer.app bundle and any mod backups."""
+    if APP_BUNDLE.exists():
+        if APP_BUNDLE.is_dir():
+            shutil.rmtree(APP_BUNDLE, ignore_errors=True)
+        else:
+            APP_BUNDLE.unlink(missing_ok=True)
+    mods_backup = DATA_DIR / "mods_backup"
+    if mods_backup.exists() and mods_backup.is_dir():
+        shutil.rmtree(mods_backup, ignore_errors=True)
 
 
 # ----------------------------------------------------------------- processes
@@ -910,6 +930,66 @@ class HostAudio:
     def __init__(self, fifo, keep, player):
         self.fifo, self.keep, self.player = fifo, keep, player
         self.restarted_at = 0.0
+        # The microphone (voice chat): the shim reads raw float32 audio from a
+        # second FIFO. A recorder runs only while the game asks for it, with
+        # a request file next to the FIFO naming the rate and channel count.
+        self.input_fifo = fifo.with_name(fifo.name.replace("audio-", "audio-in-"))
+        self.request = Path(str(self.input_fifo) + ".request")
+        self.recorder = None
+        self.recording = None
+        for path in (self.input_fifo, self.request):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        os.mkfifo(self.input_fifo, 0o600)
+
+    def _keep_recording(self):
+        wanted = None
+        try:
+            rate, channels = self.request.read_text().split()[:2]
+            if 8000 <= int(rate) <= 192000 and 1 <= int(channels) <= 2:
+                wanted = (int(rate), int(channels))
+        except (OSError, ValueError):
+            pass
+        if self.recorder and (self.recorder.poll() is not None or wanted != self.recording):
+            self._stop_recorder()
+        if wanted and not self.recorder:
+            command = self._recorder_command(self.input_fifo, *wanted)
+            if command:
+                try:
+                    self.recorder = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    self.recording = wanted
+                except OSError:
+                    pass
+
+    def _stop_recorder(self):
+        if not self.recorder:
+            return
+        self.recorder.terminate()
+        try:
+            self.recorder.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.recorder.kill()
+        self.recorder = None
+        self.recording = None
+
+    @classmethod
+    def _recorder_command(cls, fifo, rate, channels):
+        runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+        pipewire = os.environ.get("PIPEWIRE_REMOTE") or (runtime / "pipewire-0").exists()
+        if pipewire and shutil.which("pw-cat"):
+            return ["pw-cat", "--record", "--raw", "--format", "f32", "--rate", str(rate),
+                    "--channels", str(channels), "--latency", "20ms", "--media-role", "Communication",
+                    "-P", '{ application.name = "Roblox" application.icon-name = "macoblox" '
+                          f'media.name = "Roblox microphone (Mac O’ Blox)" }}',
+                    str(fifo)]
+        if shutil.which("pacat"):
+            return ["pacat", "--record", "--raw", "--format=float32le", f"--rate={rate}",
+                    f"--channels={channels}", "--latency-msec=20", "--client-name=Roblox",
+                    "--stream-name=Roblox microphone (Mac O’ Blox)", "--property=media.role=phone", str(fifo)]
+        return None
 
     @classmethod
     def _spawn(cls, fifo):
@@ -924,6 +1004,7 @@ class HostAudio:
     def keep_playing(self):
         """Restart the player if it has exited (PipeWire restarted, say):
         the game keeps writing into the FIFO and would stay silent."""
+        self._keep_recording()
         if self.player.poll() is None or time.time() - self.restarted_at < 5:
             return
         self.restarted_at = time.time()
@@ -965,6 +1046,12 @@ class HostAudio:
         # pw-cat sits in a blocking read on the FIFO and only sees SIGTERM
         # once that returns: closing the last writer ends the read (end of
         # file). A player that still hangs is killed and reaped.
+        self._stop_recorder()
+        for path in (self.input_fifo, self.request):
+            try:
+                path.unlink()
+            except OSError:
+                pass
         os.close(self.keep)
         self.player.terminate()
         try:
@@ -1019,6 +1106,7 @@ class RobloxSession:
             variables.append(f"MACOBLOX_DNS={self.dns.address}")
         if self.audio:
             variables.append(f"MACOBLOX_AUDIO_FIFO=/Volumes/SystemRoot{self.audio.fifo}")
+            variables.append(f"MACOBLOX_AUDIO_INPUT_FIFO=/Volumes/SystemRoot{self.audio.input_fifo}")
         else:
             # Darling's own audio path crashes the game (see HostAudio).
             variables.append("MACOBLOX_AUDIO=0")
@@ -1059,6 +1147,11 @@ class RobloxSession:
             _terminate(leftover, wait=3)
         orphans = clear_orphaned_darling()
         prepare_prefix(env)
+        try:
+            from . import mods
+            mods.apply_mods(self.settings)
+        except Exception as e:
+            logging.getLogger("macoblox").warning("Failed to apply mods: %s", e)
         provider = self.settings.get("dns", "system")
         if provider != "system" and (provider != "custom" or self.settings.get("dns_custom")):
             from .dns import DnsForwarder

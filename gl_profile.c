@@ -114,9 +114,25 @@ DYLD_INTERPOSE(macoblox_eglCreateContext, eglCreateContext)
  * renderer name without the vendor word. MACOBLOX_GL_COMPAT=1 keeps it. */
 extern const unsigned char *glGetString(unsigned int);
 
+extern char *strstr(const char *, const char *);
+
 static const unsigned char *macoblox_glGetString(unsigned int name) {
     static char renderer[256];
+    static int reported;
     const unsigned char *value = glGetString(name);
+    if (name == 0x1F01 && value && !reported) {
+        /* Once in the log: which driver draws. llvmpipe means no GPU driver
+         * reached Darling, the game then crawls at a few frames per second. */
+        reported = 1;
+        const unsigned char *version = glGetString(0x1F02);
+        const char *text = (const char *)value;
+        int software = strstr(text, "llvmpipe") || strstr(text, "softpipe") || strstr(text, "SWR");
+        char line[512];
+        int length = snprintf(line, sizeof line, "[MacOBlox GL] renderer: %s (OpenGL %s)%s\n", text,
+                              version ? (const char *)version : "?",
+                              software ? " -- SOFTWARE RENDERING: the GPU driver is not in use" : "");
+        if (length > 0) write(2, line, (unsigned long)length);
+    }
     if (name != 0x1F01 || !value || !core_enabled())
         return value;
     const char *text = (const char *)value;
