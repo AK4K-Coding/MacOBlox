@@ -25,7 +25,9 @@ static void macoblox_traced_exit(int status) {
         write(2, message, sizeof(message) - 1);
         backtrace_symbols_fd(frames, backtrace(frames, 48), 2);
     }
-    exit(status);
+    /* Never call the interposed exit() — that would recurse.
+     * Go straight to the immediate exit path (no atexit handlers). */
+    macoblox_immediate_exit(status);
 }
 __attribute__((used,section("__DATA,__interpose")))
 static const void *exit_trace_interpose[] = {(const void *)macoblox_traced_exit, (const void *)exit};
