@@ -178,6 +178,28 @@ cd MacOBlox
   `~/.config/macoblox/web`, «Выйти» удаляет их.
 - Новый ID приложения `wtf.aubree.MacOBlox` (Flatpak, .desktop, MIME, лаунчер,
   пакеты); установщики убирают старые файлы `xyz.narez.*`. Версия 0.15.
+- Микрофон для голосового чата (`audio_hal.c`): Roblox ведёт AUHAL-юнит как
+  WebRTC — включает ввод на шине 1 (`kAudioOutputUnitProperty_EnableIO`),
+  ставит формат клиента (scope 2, элемент 1, обычно 48 кГц моно float32) и
+  input callback (2005), внутри которого `AudioUnitRender` забирает кадры.
+  Шим читает float32 из второго FIFO (`MACOBLOX_AUDIO_INPUT_FIFO`, 10 мс блоками
+  в кольцо) и зовёт callback на каждый блок; `AudioUnitRender` на шине 1 отдаёт
+  кадры в формате клиента (float32/int16, interleaved и нет). Запись на хосте
+  идёт только пока игра слушает: при старте шим пишет файл `<fifo>.request`
+  («частота каналы»), лаунчер (`HostAudio._keep_recording`, раз в тик
+  keep_playing) запускает `pw-cat --record` (или `pacat`) с ролью Communication,
+  при остановке файл удаляется и запись завершается. `AVCaptureDevice
+  authorizationStatusForMediaType:` и `requestAccessForMediaType:` (в Darling нет)
+  отвечают «разрешено». Проверено тест-клиентом в Darling: 290 callback'ов за
+  3 с, RMS 0.353 от тона 0.5 (ожидалось 0.354). В Darling процесс с шимом
+  падает после возврата из main (и в сборке до микрофона тоже) — отдельная
+  проблема выхода, на игру не влияет.
+- Flatpak: «Cannot determine your user name» при запуске. `darling` берёт имя
+  пользователя через `getpwuid(geteuid())`, а darling-noroot.so отвечает ему
+  euid 0; в /etc/passwd песочницы Flatpak нет записи root, а запасной
+  `getlogin()` требует loginuid, который некоторые дисплей-менеджеры не ставят
+  (darling#715). Теперь `getpwuid(0)` в darling/darlingserver отдаёт запись
+  настоящего пользователя.
 
 ## Что проверить дальше
 

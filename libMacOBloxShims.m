@@ -1879,6 +1879,19 @@ static id empty_capture_devices(id cls, SEL cmd) {
         (id)objc_getClass("NSArray"), sel_registerName("array"));
 }
 
+// +[AVCaptureDevice authorizationStatusForMediaType:] and
+// requestAccessForMediaType:completionHandler: (voice chat asks for the
+// microphone): granted; the host's own permissions still apply.
+static long capture_authorization_status(id cls, SEL cmd, id media_type) {
+    (void)cls; (void)cmd; (void)media_type;
+    return 3; // AVAuthorizationStatusAuthorized
+}
+struct MacOBloxBoolBlock { void* isa; int flags; int reserved; void (*invoke)(void*, signed char); };
+static void capture_request_access(id cls, SEL cmd, id media_type, struct MacOBloxBoolBlock* handler) {
+    (void)cls; (void)cmd; (void)media_type;
+    if (handler && handler->invoke)
+        handler->invoke(handler, 1);
+}
 static id empty_capture_devices_for_media_type(id cls, SEL cmd, id media_type) {
     (void)media_type;
     return empty_capture_devices(cls, cmd);
@@ -4648,6 +4661,16 @@ static void install_swizzles(void) {
             class_addMethod(capture_device_meta_class, default_for_type,
                             (IMP)no_default_capture_device, "@@:@"))
             write_str("[MacOBlox] Added AVCaptureDevice defaultDeviceWithMediaType:=nil\n");
+        // Voice chat asks for microphone permission through these (Darling
+        // has neither): granted, the host's own permissions apply.
+        SEL authorization = sel_registerName("authorizationStatusForMediaType:");
+        SEL request_access = sel_registerName("requestAccessForMediaType:completionHandler:");
+        if (!class_getClassMethod(capture_device_class, authorization) &&
+            class_addMethod(capture_device_meta_class, authorization,
+                            (IMP)capture_authorization_status, "q@:@") &&
+            class_addMethod(capture_device_meta_class, request_access,
+                            (IMP)capture_request_access, "v@:@@?"))
+            write_str("[MacOBlox] Added AVCaptureDevice media permission (granted)\n");
     }
 
     Class layerCls = objc_getClass("CALayer");
