@@ -526,7 +526,7 @@ class FlagsPage(Adw.PreferencesPage):
 
     def _reset_all_flags(self):
         self.flags.clear()
-        core.save_framerate_cap(-1)
+        self.window.set_setting("framerate_cap", 0)
         core.save_fast_flags({})
 
         for reset_func in self.preset_resetters:
