@@ -131,6 +131,9 @@ RU = {
         "Множитель движения мыши при вращении камеры",
     "Show the launcher after Roblox exits": "Показывать лаунчер после выхода из Roblox",
     "Hide launcher while playing": "Скрывать лаунчер во время игры",
+    "Raw mouse input": "Сырой ввод мыши",
+    "Camera moves by the mouse's own motion, without pointer acceleration (XInput 2)":
+        "Камера следует за движением самой мыши, без ускорения указателя (XInput 2)",
     "Hide the launcher window while the game is running": "Скрывать окно лаунчера, пока запущена игра",
     "Discord Rich Presence": "Discord Rich Presence",
     "Show current game and playtime in your Discord status": "Показывать статус игры и время в Discord",

@@ -612,6 +612,13 @@ class SettingsPage(Adw.Bin):
         sensitivity.connect("notify::value", lambda row, _pspec: window.set_setting(
             "mouse_sensitivity", round(row.get_value(), 2)))
         game.add(sensitivity)
+        raw_mouse = Adw.SwitchRow(title=_("Raw mouse input"),
+                                  subtitle=_("Camera moves by the mouse's own motion, without pointer acceleration (XInput 2)"),
+                                  active=settings.get("raw_mouse", True))
+        raw_mouse.connect("notify::active", lambda row, _pspec: window.set_setting(
+            "raw_mouse", row.get_active()))
+        game.add(raw_mouse)
+
         menu_bar = Adw.SwitchRow(title=_("Hide the macOS menu bar"),
                                  subtitle=_("The Roblox, Edit, Window… strip at the top of the game window"),
                                  active=settings["hide_menu_bar"])

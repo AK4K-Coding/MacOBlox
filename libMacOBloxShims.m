@@ -2415,6 +2415,228 @@ static void macoblox_set_x_cursor_hidden(int hidden) {
         write(macoblox_cursor_wake[1], "w", 1);
 }
 
+
+// Raw motion for the lock (raw_mouse.c). With XInput 2 the camera deltas
+// come from the mouse itself: no pointer acceleration, no merged motion, and
+// the warps that keep the hidden pointer inside the window need no
+// recognising, since warps produce no raw events. While it is active the
+// game gets no pointer motion at all during the lock: every raw motion is
+// posted as a mouse event of its own with the deltas (merged with the last
+// queued one of the same kind, so a 1000 Hz mouse does not pile up events),
+// and the real MotionNotify events only serve to keep the pointer near its
+// anchor. The selection changes on the event loop's own thread and X
+// connection (the game thread only asks). MACOBLOX_RAW_MOUSE=0 keeps the
+// pointer-delta lock.
+typedef struct objc_ivar* Ivar; // also declared with the cursor code below
+extern Ivar class_getInstanceVariable(Class, const char*);
+extern long ivar_getOffset(Ivar);
+extern int macoblox_raw_mouse_select(void* display, int enabled);
+extern int macoblox_raw_mouse_event(void* display, void* event, double* dx, double* dy);
+static id macoblox_event_queue(id display);
+static void macoblox_lock_event_queue(void);
+static void macoblox_unlock_event_queue(void);
+static unsigned long macoblox_event_type(id event);
+static double (*orig_mouse_event_delta_x)(id, SEL);
+static double (*orig_mouse_event_delta_y)(id, SEL);
+static volatile int macoblox_raw_mouse_wanted;   // the lock state, set by the game thread
+static int macoblox_raw_mouse_selected;          // what the event loop applied last
+static volatile int macoblox_raw_mouse_active;   // raw events selected: deltas come from them
+static unsigned int macoblox_raw_buttons;        // X buttons held, bit 1..3
+static int macoblox_raw_have_anchor;
+static int macoblox_raw_anchor_x, macoblox_raw_anchor_y; // X window coordinates, y down
+static int macoblox_raw_start_x, macoblox_raw_start_y;   // where the pointer was when the lock began
+static int macoblox_raw_last_x, macoblox_raw_last_y;     // the last position seen
+static long macoblox_raw_events, macoblox_raw_posted;
+static int macoblox_raw_motions_without_raw; // pointer motion seen while no raw event came
+
+static int macoblox_raw_mouse_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* value = getenv("MACOBLOX_RAW_MOUSE");
+        enabled = !(value && value[0] == '0');
+    }
+    return enabled;
+}
+
+static void* macoblox_x11_display_connection(id display) {
+    static long offset = -2;
+    if (offset == -2) {
+        Ivar ivar = class_getInstanceVariable(object_getClass(display), "_display");
+        offset = ivar ? (long)ivar_getOffset(ivar) : -1;
+    }
+    return offset >= 0 ? *(void**)((char*)display + offset) : (void*)0;
+}
+
+static void macoblox_warp_on_display(void* display, int dx, int dy) {
+    static int (*warp)(void*, unsigned long, unsigned long, int, int, unsigned int, unsigned int, int, int);
+    static int (*flush)(void*);
+    if (!warp) {
+        warp = (int (*)(void*, unsigned long, unsigned long, int, int, unsigned int, unsigned int, int, int))
+            dlsym(RTLD_DEFAULT, "XWarpPointer");
+        flush = (int (*)(void*))dlsym(RTLD_DEFAULT, "XFlush");
+    }
+    if (!warp || !display || (!dx && !dy))
+        return;
+    warp(display, 0, 0, 0, 0, 0, 0, dx, dy);
+    if (flush)
+        flush(display);
+}
+
+// One mouse event with the raw deltas, on the lock window. Darling's deltaY
+// is computed upward and hooked_mouse_event_delta_y flips it for the game,
+// so the raw y (downward, as macOS reports it) is stored flipped.
+static void macoblox_post_raw_motion(id display, double dx, double dy) {
+    id window = macoblox_lock_window();
+    if (!window)
+        return;
+    unsigned long type = (macoblox_raw_buttons & (1u << 1)) ? 6 : (macoblox_raw_buttons & (1u << 3)) ? 7 : 5;
+    id event_class = (id)objc_getClass("NSEvent");
+    unsigned long flags = ((unsigned long (*)(id, SEL))objc_msgSend)(event_class, sel_registerName("modifierFlags"));
+    double event_dx = dx, event_dy = -dy;
+    SEL delta_x = sel_registerName("deltaX"), delta_y = sel_registerName("deltaY");
+    id queue = macoblox_event_queue(display);
+    if (queue) {
+        // Merge with the last queued event of the same kind: every count of
+        // the mouse is kept, the game handles one event per frame or so.
+        macoblox_lock_event_queue();
+        unsigned long total = ((unsigned long (*)(id, SEL))objc_msgSend)(queue, sel_registerName("count"));
+        if (total) {
+            id last = ((id (*)(id, SEL, unsigned long))objc_msgSend)(queue, sel_registerName("objectAtIndex:"), total - 1);
+            if (macoblox_event_type(last) == type &&
+                ((id (*)(id, SEL))objc_msgSend)(last, sel_registerName("window")) == window &&
+                ((unsigned long (*)(id, SEL))objc_msgSend)(last, sel_registerName("modifierFlags")) == flags) {
+                event_dx += orig_mouse_event_delta_x ? orig_mouse_event_delta_x(last, delta_x)
+                    : ((double (*)(id, SEL))objc_msgSend)(last, delta_x);
+                event_dy += orig_mouse_event_delta_y ? orig_mouse_event_delta_y(last, delta_y)
+                    : ((double (*)(id, SEL))objc_msgSend)(last, delta_y);
+                ((void (*)(id, SEL, unsigned long))objc_msgSend)(queue, sel_registerName("removeObjectAtIndex:"), total - 1);
+                macoblox_raw_posted--;
+            }
+        }
+        macoblox_unlock_event_queue();
+    }
+    id event = ((id (*)(id, SEL, unsigned long, MacOBloxPoint, unsigned long, id, long, double, double))objc_msgSend)(
+        event_class, sel_registerName("mouseEventWithType:location:modifierFlags:window:clickCount:deltaX:deltaY:"),
+        type, macoblox_frozen_window_location, flags, window, 1, event_dx, event_dy);
+    if (!event)
+        return;
+    ((void (*)(id, SEL, id, signed char))objc_msgSend)(display, sel_registerName("postEvent:atStart:"), event, 0);
+    macoblox_raw_posted++;
+}
+
+// X events of the event loop, before Darling sees them. Returns 1 when the
+// event is consumed here.
+static int macoblox_raw_mouse_x_event(id self, void* event) {
+    if (!macoblox_raw_mouse_enabled())
+        return 0;
+    void* display = macoblox_x11_display_connection(self);
+    if (!display)
+        return 0;
+    int wanted = macoblox_raw_mouse_wanted;
+    static volatile int trace_events = -1;
+    if (macoblox_pointer_grabbed && macoblox_env_cached("MACOBLOX_TRACE_LOCK", &trace_events)) {
+        static long traced;
+        if (traced++ < 40) {
+            write_str("[MacOBlox Lock] X event type=");
+            print_num(*(int*)event);
+            write_str(wanted ? " wanted=1" : " wanted=0");
+            write_str(macoblox_raw_mouse_active ? " active=1\n" : " active=0\n");
+        }
+    }
+    if (wanted != macoblox_raw_mouse_selected) {
+        int selected = macoblox_raw_mouse_select(display, wanted);
+        macoblox_raw_mouse_selected = wanted;
+        macoblox_raw_mouse_active = wanted && selected;
+        macoblox_raw_have_anchor = 0;
+        macoblox_raw_events = macoblox_raw_posted = 0;
+        macoblox_raw_motions_without_raw = 0;
+        static int reported;
+        if (wanted && !reported) {
+            reported = 1;
+            write_str(selected ? "[MacOBlox Input] mouse lock uses raw motion (XInput 2)\n"
+                               : "[MacOBlox Input] no raw motion, mouse lock uses pointer deltas\n");
+        }
+    }
+    int type = *(int*)event;
+    double dx, dy;
+    if (macoblox_raw_mouse_event(display, event, &dx, &dy)) {
+        if (macoblox_raw_mouse_active && macoblox_pointer_grabbed && (dx != 0 || dy != 0)) {
+            macoblox_raw_events++;
+            macoblox_raw_motions_without_raw = 0;
+            macoblox_post_raw_motion(self, dx, dy);
+            static volatile int trace = -1;
+            if (macoblox_env_cached("MACOBLOX_TRACE_LOCK", &trace) && macoblox_raw_events <= 200) {
+                write_str("[MacOBlox Lock] raw dx=");
+                print_num((long long)dx);
+                write_str(" dy=");
+                print_num((long long)dy);
+                write_str("\n");
+            }
+        }
+        return 1;
+    }
+    if (type == 4 || type == 5) { /* XButtonEvent: button at 84 */
+        unsigned int button = *(unsigned int*)((char*)event + 84);
+        if (button >= 1 && button <= 3) {
+            if (type == 4) macoblox_raw_buttons |= 1u << button;
+            else macoblox_raw_buttons &= ~(1u << button);
+        }
+        return 0;
+    }
+    if (type == 6 && macoblox_raw_mouse_active && macoblox_pointer_grabbed) {
+        /* XMotionEvent: x/y at 64/68. The pointer stays near its anchor;
+         * the game gets no pointer motion during the lock. */
+        int x = *(int*)((char*)event + 64), y = *(int*)((char*)event + 68);
+        // The pointer moves but no raw event ever came (a server that
+        // selected fine but does not deliver them): back to pointer deltas
+        // for this lock, so the camera keeps working.
+        if (!macoblox_raw_events && ++macoblox_raw_motions_without_raw > 25) {
+            macoblox_raw_mouse_active = 0;
+            write_str("[MacOBlox Input] no raw motion arrived, mouse lock uses pointer deltas\n");
+            return 0;
+        }
+        macoblox_raw_last_x = x;
+        macoblox_raw_last_y = y;
+        if (!macoblox_raw_have_anchor) {
+            macoblox_raw_have_anchor = 1;
+            macoblox_raw_start_x = macoblox_raw_anchor_x = x;
+            macoblox_raw_start_y = macoblox_raw_anchor_y = y;
+            id window = macoblox_lock_window();
+            if (window) {
+                // A lock that begins near the window edge: anchor inward, so
+                // the pointer cannot leave the window before it drifts far
+                // enough to be pulled back.
+                MacOBloxPoint center = macoblox_window_center(window);
+                int width = (int)(center.x * 2), height = (int)(center.y * 2);
+                int margin = (int)MACOBLOX_LOCK_RADIUS + 20;
+                if (width > margin * 2) {
+                    if (macoblox_raw_anchor_x < margin) macoblox_raw_anchor_x = margin;
+                    if (macoblox_raw_anchor_x > width - margin) macoblox_raw_anchor_x = width - margin;
+                } else {
+                    macoblox_raw_anchor_x = width / 2;
+                }
+                if (height > margin * 2) {
+                    if (macoblox_raw_anchor_y < margin) macoblox_raw_anchor_y = margin;
+                    if (macoblox_raw_anchor_y > height - margin) macoblox_raw_anchor_y = height - margin;
+                } else {
+                    macoblox_raw_anchor_y = height / 2;
+                }
+            }
+        }
+        int ox = x - macoblox_raw_anchor_x, oy = y - macoblox_raw_anchor_y;
+        if (ox > MACOBLOX_LOCK_RADIUS || ox < -MACOBLOX_LOCK_RADIUS ||
+            oy > MACOBLOX_LOCK_RADIUS || oy < -MACOBLOX_LOCK_RADIUS ||
+            (macoblox_raw_anchor_x != macoblox_raw_start_x && x == macoblox_raw_start_x && y == macoblox_raw_start_y) ||
+            (macoblox_raw_anchor_y != macoblox_raw_start_y && x == macoblox_raw_start_x && y == macoblox_raw_start_y)) {
+            macoblox_warp_on_display(display, -ox, -oy);
+            macoblox_raw_last_x = macoblox_raw_anchor_x;
+            macoblox_raw_last_y = macoblox_raw_anchor_y;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static int macoblox_CGAssociateMouseAndMouseCursorPosition(unsigned int connected) {
     int grab = !connected;
     if (grab == macoblox_pointer_grabbed)
@@ -2423,6 +2645,7 @@ static int macoblox_CGAssociateMouseAndMouseCursorPosition(unsigned int connecte
         write_str(grab ? "[MacOBlox Input] mouse lock on\n"
                        : "[MacOBlox Input] mouse lock off\n");
     macoblox_drop_warp_motion = 0;
+    macoblox_raw_mouse_wanted = grab;
     if (grab) {
         id window = macoblox_lock_window();
         SEL screen_selector = sel_registerName("mouseLocation");
@@ -2470,7 +2693,12 @@ static int macoblox_CGAssociateMouseAndMouseCursorPosition(unsigned int connecte
         // still hidden, then show it.
         macoblox_pointer_grabbed = 0;
         id window = macoblox_lock_window();
-        if (window) {
+        if (macoblox_raw_mouse_active && macoblox_raw_have_anchor) {
+            // Darling saw no pointer motion during the lock; the event loop
+            // did (X coordinates, y down; the warp takes Cocoa's y up).
+            macoblox_warp_pointer_by(macoblox_raw_start_x - macoblox_raw_last_x,
+                                     macoblox_raw_last_y - macoblox_raw_start_y);
+        } else if (window) {
             MacOBloxPoint location = macoblox_real_window_mouse_location(window);
             macoblox_warp_pointer_by(macoblox_frozen_window_location.x - location.x,
                                      macoblox_frozen_window_location.y - location.y);
@@ -2517,7 +2745,7 @@ static void macoblox_trace_lock_motion(id event, double dx, double dy, const cha
 }
 
 static int macoblox_filter_locked_motion(id event) {
-    if (!macoblox_pointer_grabbed)
+    if (!macoblox_pointer_grabbed || macoblox_raw_mouse_active)
         return 0;
     // Raw Darling deltas (Cocoa axes), without sign flip or sensitivity.
     SEL delta_x = sel_registerName("deltaX"), delta_y = sel_registerName("deltaY");
@@ -3553,6 +3781,26 @@ static int macoblox_trace_keys_enabled(void) {
 }
 static void hooked_post_x_event(id self, SEL cmd, void* event) {
     int type = *(int*)event;
+    {
+        static volatile int trace_x = -1;
+        static long traced_x;
+        if (macoblox_env_cached("MACOBLOX_TRACE_XEVENTS", &trace_x) && traced_x++ < 80) {
+            write_str("[MacOBlox X] event type=");
+            print_num(type);
+            write_str(" display=");
+            print_num((long long)(unsigned long)macoblox_x11_display_connection(self));
+            static char* (*display_string)(void*);
+            if (!display_string)
+                display_string = (char* (*)(void*))dlsym(RTLD_DEFAULT, "XDisplayString");
+            if (display_string && macoblox_x11_display_connection(self)) {
+                write_str(" ");
+                write_str(display_string(macoblox_x11_display_connection(self)));
+            }
+            write_str(macoblox_pointer_grabbed ? " locked\n" : "\n");
+        }
+    }
+    if (macoblox_raw_mouse_x_event(self, event))
+        return;
     if (type == 6 /* MotionNotify */) {
         static int compression = -1;
         static int (*queued)(void*, int);

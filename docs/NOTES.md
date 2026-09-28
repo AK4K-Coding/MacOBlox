@@ -194,6 +194,19 @@ cookies); the old build fails the new tests, while the new one passes them all.
   3 seconds, RMS 0.353 from a tone of 0.5 (0.354 was expected). In Darling, the process with the shim
   crashes after returning from `main` (and in the build before the microphone as well)—a separate
   exit issue that does not affect gameplay.
+- Raw mouse motion for the lock (`raw_mouse.c`, "Raw motion" in the shim): the
+  camera deltas during mouse lock come from XInput 2 raw events (device
+  counts, before pointer acceleration, at the mouse's report rate; warps make
+  none) instead of Darling's position-based deltas. Selected on the event
+  loop's connection at the first X event after the lock (XISelectEvents from
+  the host libXi through elfcalls), one mouse event per raw event merged with
+  the last queued one; MotionNotify only keeps the pointer within 100 px of
+  its anchor and is not delivered. Falls back to pointer deltas when XI2 is
+  missing or no raw event arrives while the pointer moves. Launcher switch
+  "Raw mouse input" (MACOBLOX_RAW_MOUSE=0). After spidercraft's RbxRawMotion.
+  Verified in Darling against Xvfb: raw deltas equal the xdotool moves; the
+  in-game camera is to be checked by hand. MACOBLOX_TRACE_XEVENTS=1 logs the
+  first 80 X events reaching postXEvent:.
 - Flatpak: “Cannot determine your user name” on startup. `darling` retrieves the
   username via `getpwuid(geteuid())`, and darling-noroot.so returns
   euid 0; there is no root entry in the Flatpak sandbox’s /etc/passwd, and the fallback

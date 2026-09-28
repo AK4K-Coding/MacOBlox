@@ -75,6 +75,7 @@ DOWNLOAD_URL = "https://setup.rbxcdn.com/mac/{upload}-RobloxPlayer.zip"
 DEFAULT_SETTINGS = {
     "language": "en",
     "mouse_sensitivity": 1.0,
+    "raw_mouse": True,
     "hide_menu_bar": False,
     "dns": "system",
     "dns_custom": "",
@@ -1114,6 +1115,8 @@ class RobloxSession:
             variables.append(f"MACOBLOX_VRAM_BYTES={vram}")
         if self.settings.get("hide_menu_bar"):
             variables.append("MACOBLOX_HIDE_MENU_BAR=1")
+        if not self.settings.get("raw_mouse", True):
+            variables.append("MACOBLOX_RAW_MOUSE=0")
         if self.settings.get("framerate_cap", 0) > 0:
             variables.append(f"MACOBLOX_FRAMERATE_CAP={int(self.settings['framerate_cap'])}")
         if self.web_socket:
