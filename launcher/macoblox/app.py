@@ -612,6 +612,16 @@ class SettingsPage(Adw.Bin):
         sensitivity.connect("notify::value", lambda row, _pspec: window.set_setting(
             "mouse_sensitivity", round(row.get_value(), 2)))
         game.add(sensitivity)
+
+        scroll_sens = Adw.SpinRow.new_with_range(0.5, 10.0, 0.5)
+        scroll_sens.set_digits(1)
+        scroll_sens.set_title(_("Scroll sensitivity"))
+        scroll_sens.set_subtitle(_("Mouse wheel scroll speed in menus and interface"))
+        scroll_sens.set_value(settings.get("scroll_sensitivity", 1.5))
+        scroll_sens.connect("notify::value", lambda row, _pspec: window.set_setting(
+            "scroll_sensitivity", round(row.get_value(), 2)))
+        game.add(scroll_sens)
+
         raw_mouse = Adw.SwitchRow(title=_("Raw mouse input"),
                                   subtitle=_("Camera moves by the mouse's own motion, without pointer acceleration (XInput 2)"),
                                   active=settings.get("raw_mouse", True))

@@ -2814,21 +2814,52 @@ static double macoblox_mouse_sensitivity(void) {
     }
     return value;
 }
+// MACOBLOX_SCROLL_SENSITIVITY scales wheel delta for UI menus and scrolling.
+static double macoblox_scroll_sensitivity(void) {
+    static double value = -1;
+    if (value < 0) {
+        const char* text = getenv("MACOBLOX_SCROLL_SENSITIVITY");
+        double parsed = 0;
+        if (text && text[0]) {
+            double scale = 1;
+            int fraction = 0;
+            for (const char* c = text; *c; c++) {
+                if (*c >= '0' && *c <= '9') {
+                    if (fraction) { scale /= 10; parsed += (*c - '0') * scale; }
+                    else parsed = parsed * 10 + (*c - '0');
+                } else if (*c == '.' || *c == ',') {
+                    fraction = 1;
+                }
+            }
+        }
+        value = parsed > 0.1 && parsed < 30 ? parsed : 1.5;
+    }
+    return value;
+}
 static int macoblox_is_motion_type(id event) {
     unsigned long type = ((unsigned long (*)(id, SEL))objc_msgSend)(
         event, sel_registerName("type"));
     return type == 5 || type == 6 || type == 7 || type == 27;
+}
+static int macoblox_is_scroll_type(id event) {
+    unsigned long type = ((unsigned long (*)(id, SEL))objc_msgSend)(
+        event, sel_registerName("type"));
+    return type == 22; // NSScrollWheel
 }
 static double (*orig_mouse_event_delta_x)(id, SEL) = 0;
 static double hooked_mouse_event_delta_x(id self, SEL cmd) {
     double delta = orig_mouse_event_delta_x(self, cmd);
     if (macoblox_pointer_grabbed && macoblox_is_motion_type(self))
         return delta * macoblox_mouse_sensitivity();
+    if (macoblox_is_scroll_type(self))
+        return delta * macoblox_scroll_sensitivity();
     return delta;
 }
 static double (*orig_mouse_event_delta_y)(id, SEL) = 0;
 static double hooked_mouse_event_delta_y(id self, SEL cmd) {
     double delta = orig_mouse_event_delta_y(self, cmd);
+    if (macoblox_is_scroll_type(self))
+        return delta * macoblox_scroll_sensitivity();
     if (!macoblox_is_motion_type(self))
         return delta;
     delta = -delta;
@@ -2847,11 +2878,13 @@ static MacOBloxBool event_is_direction_inverted(id self, SEL cmd) {
 }
 static double event_scrolling_delta_x(id self, SEL cmd) {
     (void)cmd;
-    return ((double (*)(id, SEL))objc_msgSend)(self, sel_registerName("deltaX"));
+    double d = ((double (*)(id, SEL))objc_msgSend)(self, sel_registerName("deltaX"));
+    return d * macoblox_scroll_sensitivity();
 }
 static double event_scrolling_delta_y(id self, SEL cmd) {
     (void)cmd;
-    return ((double (*)(id, SEL))objc_msgSend)(self, sel_registerName("deltaY"));
+    double d = ((double (*)(id, SEL))objc_msgSend)(self, sel_registerName("deltaY"));
+    return d * macoblox_scroll_sensitivity();
 }
 
 // Darling's -[X11Cursor initWithImage:hotPoint:] copies each pixel row with a

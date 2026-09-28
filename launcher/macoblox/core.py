@@ -75,6 +75,7 @@ DOWNLOAD_URL = "https://setup.rbxcdn.com/mac/{upload}-RobloxPlayer.zip"
 DEFAULT_SETTINGS = {
     "language": "en",
     "mouse_sensitivity": 1.0,
+    "scroll_sensitivity": 1.5,
     "raw_mouse": True,
     "hide_menu_bar": False,
     "dns": "system",
@@ -1109,7 +1110,10 @@ class RobloxSession:
         return darling_environment()
 
     def shim_variables(self):
-        variables = [f"MACOBLOX_MOUSE_SENSITIVITY={self.settings['mouse_sensitivity']:.2f}"]
+        variables = [
+            f"MACOBLOX_MOUSE_SENSITIVITY={self.settings['mouse_sensitivity']:.2f}",
+            f"MACOBLOX_SCROLL_SENSITIVITY={self.settings.get('scroll_sensitivity', 1.5):.2f}",
+        ]
         vram = host_vram_bytes()
         if vram:
             variables.append(f"MACOBLOX_VRAM_BYTES={vram}")

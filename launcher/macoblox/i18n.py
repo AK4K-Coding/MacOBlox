@@ -129,6 +129,9 @@ RU = {
     "Camera sensitivity": "Чувствительность камеры",
     "Mouse movement multiplier while rotating the camera":
         "Множитель движения мыши при вращении камеры",
+    "Scroll sensitivity": "Чувствительность колёсика",
+    "Mouse wheel scroll speed in menus and interface":
+        "Скорость прокрутки колёсика мыши в меню и интерфейсе",
     "Show the launcher after Roblox exits": "Показывать лаунчер после выхода из Roblox",
     "Hide launcher while playing": "Скрывать лаунчер во время игры",
     "Raw mouse input": "Сырой ввод мыши",
