@@ -277,6 +277,8 @@ RU = {
     "The shim comes built with this package": "Шим в этом пакете уже собран",
     "Could not build the shim": "Не удалось собрать шим",
     "Could not build the shim:\n{output}": "Не удалось собрать шим:\n{output}",
+    "Cannot connect to X11 display {display}. Make sure an X server or Xwayland is running.":
+        "Не удалось подключиться к X11-дисплею {display}. Убедитесь, что запущен X-сервер или Xwayland.",
     "Restart Darling": "Перезапустить Darling",
     "Darling stopped, it starts with the next game": "Darling остановлен, запустится при следующей игре",
     "Could not restart Darling: {error}": "Не удалось перезапустить Darling: {error}",
