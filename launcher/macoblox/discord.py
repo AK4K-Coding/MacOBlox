@@ -36,10 +36,24 @@ class DiscordRPC:
                     candidates.append(path)
         return candidates
 
+    def _read_exact(self, s: socket.socket, length: int) -> bytes | None:
+        """Read exactly `length` bytes from socket. Returns None if EOF or error."""
+        buf = bytearray()
+        while len(buf) < length:
+            try:
+                chunk = s.recv(length - len(buf))
+                if not chunk:
+                    return None
+                buf.extend(chunk)
+            except Exception:
+                return None
+        return bytes(buf)
+
     def connect(self) -> bool:
         if self._connected and self.sock:
             return True
         for path in self._find_socket():
+            s: socket.socket | None = None
             try:
                 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 s.settimeout(2.0)
@@ -47,19 +61,25 @@ class DiscordRPC:
                 # Opcode 0: Handshake
                 payload = json.dumps({"v": 1, "client_id": self.client_id}).encode("utf-8")
                 s.sendall(struct.pack("<II", 0, len(payload)) + payload)
-                hdr = s.recv(8)
-                if len(hdr) == 8:
+                hdr = self._read_exact(s, 8)
+                if hdr and len(hdr) == 8:
                     _op, length = struct.unpack("<II", hdr)
-                    body = s.recv(length)
-                    data = json.loads(body.decode("utf-8"))
-                    if data.get("cmd") == "DISPATCH" and data.get("evt") == "READY":
-                        self.sock = s
-                        self._connected = True
-                        log.info("Connected to Discord IPC on %s", path)
-                        return True
+                    body = self._read_exact(s, length)
+                    if body:
+                        data = json.loads(body.decode("utf-8"))
+                        if data.get("cmd") == "DISPATCH" and data.get("evt") == "READY":
+                            self.sock = s
+                            self._connected = True
+                            log.info("Connected to Discord IPC on %s", path)
+                            return True
                 s.close()
             except Exception as e:
                 log.debug("Failed connecting to %s: %s", path, e)
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
         return False
 
     def update_presence(
@@ -95,10 +115,10 @@ class DiscordRPC:
             payload = json.dumps(message).encode("utf-8")
             assert self.sock is not None
             self.sock.sendall(struct.pack("<II", 1, len(payload)) + payload)
-            hdr = self.sock.recv(8)
-            if len(hdr) == 8:
+            hdr = self._read_exact(self.sock, 8)
+            if hdr and len(hdr) == 8:
                 _op, length = struct.unpack("<II", hdr)
-                self.sock.recv(length)
+                self._read_exact(self.sock, length)
             return True
         except Exception as e:
             log.debug("Failed to send presence: %s", e)
@@ -119,10 +139,10 @@ class DiscordRPC:
             }
             payload = json.dumps(message).encode("utf-8")
             self.sock.sendall(struct.pack("<II", 1, len(payload)) + payload)
-            hdr = self.sock.recv(8)
-            if len(hdr) == 8:
+            hdr = self._read_exact(self.sock, 8)
+            if hdr and len(hdr) == 8:
                 _op, length = struct.unpack("<II", hdr)
-                self.sock.recv(length)
+                self._read_exact(self.sock, length)
         except Exception:
             pass
 

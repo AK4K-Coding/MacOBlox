@@ -1673,8 +1673,9 @@ class LauncherWindow(Adw.ApplicationWindow):
     def _start_rpc(self):
         if getattr(self, "rpc", None) is None:
             self.rpc = discord.DiscordRPC()
+        rpc = self.rpc
         start = getattr(self, "game_started_at", time.time())
-        threading.Thread(target=lambda: self.rpc.update_presence(
+        threading.Thread(target=lambda: rpc.update_presence(
             details=_("Playing Roblox"),
             state=_("In Game"),
             start_time=start,
@@ -1727,6 +1728,11 @@ class LauncherWindow(Adw.ApplicationWindow):
             if time.time() - getattr(self, "last_playtime_save", 0) > 15:
                 self.last_playtime_save = time.time()
                 core.save_settings(self.settings)
+            # Retry RPC connection if Discord was launched after the game
+            if self.settings.get("discord_rpc", True):
+                rpc = getattr(self, "rpc", None)
+                if rpc and not rpc._connected and int(self.settings["playtime_seconds"]) % 5 == 0:
+                    self._start_rpc()
             return True
         self.session = None
         self._stop_web()
