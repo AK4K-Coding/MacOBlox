@@ -3,6 +3,7 @@ updates and running the macOS client through Darling. No GTK here."""
 
 import hashlib
 import json
+import logging
 import os
 import plistlib
 import re
