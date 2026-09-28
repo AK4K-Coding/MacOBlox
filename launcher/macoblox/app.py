@@ -502,7 +502,7 @@ class FlagsPage(Adw.PreferencesPage):
                         Path(file.get_path()).write_text(text, encoding="utf-8")
                         _toast(self.window.toasts, _("Flags saved to {path}", path=Path(file.get_path()).name))
                     except OSError as e:
-                        _error_dialog(self.window, _("Could not save flags: {error}", error=e))
+                        _error_dialog(self.window, _("Could not save flags"), str(e))
             d.destroy()
 
         dialog.connect("response", on_response)
