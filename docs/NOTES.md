@@ -55,120 +55,7 @@ cd MacOBlox
 ./run_debug.sh
 ```
 
-<<<<<<< patch-1
 The script compiles the library from `libMacOBloxShims.m` in `build/`, launches
-the client from the project folder within an existing Darling prefix, and writes
-the output to a separate file in `logs/launch-*.log`. Arguments are passed to the client.
-The launch itself requires a running Darling outside the restricted Codex environment.
-The launch script has not yet been tested in a running Darling instance.
-
-Build only: `./build_debug_shim.sh`. You can set `DARLING_SYSROOT`.
-The old libraries in the root directory and inside `.app` are preserved; the new one is selected
-via `DYLD_INSERT_LIBRARIES` and `DYLD_LIBRARY_PATH`.
-
-## Changes 2026-09-21
-
-- Fixed the signature of the `NSWindow initWithContentRect:…` interceptor:
-  The rectangle is passed by value; the flag uses the x86_64 BOOL ABI.
-  Signature: https://developer.apple.com/documentation/appkit/nswindow/init(contentrect:stylemask:backing:defer:)
-- Removed the call to the assumed `what()` method for arbitrary C++ exceptions.
-  A thrown object does not necessarily have a virtual table.
-- Added separate scripts for building and diagnostic runs.
-- The source code and old library are preserved in `backups/before-codex-20260921/`.
-- Cross-compilation succeeded; shell script syntax was verified.
-- The Codex environment launch check fails in Darling before Roblox starts:
-  `binary is not setuid root, which is mandatory`. In this environment, the owner
-  of the system binary is listed as nobody. This does not prove that the
-  installation on the host is broken and is not a reason to change system permissions.
-
-## Changes 2026-09-26
-
-Tested with a suite of tests under Darling (network, mutexes, waits, sound,
-cookies); the old build fails the new tests, while the new one passes them all.
-
-- Timeout waits in Darling return 0 instead of ETIMEDOUT (100 ms
-  wait — 0 after 100 ms). Therefore, the wait segments in `darling_fixes.c`
-  never grew (each 50-ms segment — a request to darlingserver), and
-  the caller never saw a timeout. Now, the elapsed time is determined by the clock;
-  for `pthread_cond_timedwait_relative_np` (which Roblox imports), the time
-  of segments already waited out is subtracted; otherwise, waits longer than a second
-  would never end.
-- kqueue: Roblox closes sockets using `close$NOCANCEL` without EV_DELETE, and
-  the socket entry remained: the next socket with the same number received
-  events from the old owner (the thread loops, a use-after-free is possible in
-  Asio). `close`/`close$NOCANCEL` have been intercepted; entries are checked against the inode.
-- The “is there data” check is now done via `poll`, not `recv(MSG_PEEK)`:
-  any receive operation, even a peek, retrieves the socket error (ICMP “port unreachable”),
-  and after that, `recv(MSG_DONTWAIT)` on a blocking socket would hang indefinitely.
-- UDP watcher pins—only for network sockets (AF_INET/AF_INET6), not for
-  local pairs used by threads to wake each other up; the thread waiting on the mutex
-  is checked again before the pin.
-- Cookies: `cookiesForURL:` Darling ignores the URL, and `setCookies:forURL:…`
-  does nothing. Storage is now managed in-house: domain, path, Secure, and expiration time
-  are checked (login credentials no longer go to third-party hosts or over HTTP), the new
-  value replaces the old one, file writing is atomic, immediately set to 0600; session
-  cookies are stored only in memory; third-party domains in Set-Cookie are rejected.
-- Event queue: “no event” — type 100, as in Darling (NSApplication
-  compares it to 0x64). Type 13 was a real event at point (0,0).
-- Keys: on FocusOut, the table of pressed keys is reset (Alt+Tab with
-  W held down no longer leaves it “pressed” for CGEventSourceKeyState).
-- Mouse capture: while our warp is active, movement events are not merged; if
-  the movement from the warp never arrives, centering resumes after 8
-  events (previously it was disabled until the end of the capture).
-- The XFixes stream sleeps on the pipe instead of polling every 5 ms via usleep
-  Darling (400 requests to darlingserver per second); it starts at launch.
-- getaddrinfo: pause between attempts without blocking; retry only in case of
-  temporary errors; wait using Linux direct sleep.
-- Exception hooks, makeCurrentContext, flushBuffer: getenv and dlsym are called once,
-  rather than on every throw or frame (Lua errors in games are C++ exceptions).
-- Shaders: the Mesa fix applies to all shaders (not just the
-  first 8192); source code is stored only with `MACOBLOX_TRACE_GL=1`.
-- `fast_libc.c`: SSE loops instead of `rep movsb/stosb` where those are slower
-  (short copies, 4K aliasing, more L2), fast memchr/strlen/strcmp,
-  memset_pattern4/8/16 have been reimplemented.
-- `MACOBLOX_*=0` flags now mean “disabled.”
-
-## Changes September 26, 2026, evening: locks without darlingserver
-
-- In Darling, mutexes and conditional variables (psynch) are waited on via
-  darlingserver: every lock acquisition under load, every wait, and every signal—
-  a request to the server (40% of the game’s CPU usage)—wakes are lost, and conditional
-  variables break (the timeout arrives as a wake, counters
-  diverging, followed by “psync_cvwait; invalid sequence numbers” and EINVAL on
-  every wait—12,874 times in 7 minutes in the server log).
-- Now, in `darling_fixes.c`, a busy mutex waits on a Linux futex (the table
-  at the mutex’s address, woken by `pthread_mutex_unlock`), while the condition variables
-  are separate: a queue of waiters, each with its own futex; a signal wakes exactly one,
-  a broadcast wakes exactly the number of waiters, and process signals do not interrupt the wait.
-  Conditional variables created by Darling itself (tag ‘COND’/0x434F4E45,
-  process-shared) remain its own. “Queue” test: 13.6 s and 18.5 s CPU
-  darlingserver → 0.13 s and 0.04 s.
-- `PTHREAD_MUTEX_USE_ULOCK=1` (libpthread mode using ulock) is not suitable:
-  its condition variables call `__ulock_wait2` (syscall 544), which is not
-  present in Darling—the process crashes on the first wait.
-- Launcher: “Restart Darling” stops the entire container (launchd and
-  daemons—which are not children of darlingserver and remained orphaned with ~250 MB), and upon
-  startup, it terminates Darling processes without a running server and waits until
-  the previous game closes (otherwise, both would share the same server and crash together).
-
-## What to Check Next
-
-We need a recent startup log from a regular terminal. Use it to determine where
-the client is crashing: the loader, NIB loading, window creation, or rendering.
-According to the owner’s recollection, the engine used to start up, but there was no image;
-an old log confirming this has not yet been found.
-
-There are still potential issues in the old code: some fatal signals
-are suppressed, and the error handler manually parses the context and stack trace. These areas
-require separate verification. Cocoa string constants have been updated to NSString.
-`build_shims.py` is an old script that directly modifies the frameworks
-in `~/.darling`; the new scripts do not run it automatically.
-In `ffmpeg_compat/`, there are links between different ABI versions; compatibility
-has not been verified, and the new build does not add this folder to the library path.
-
-Accessing host files via `/Volumes/SystemRoot` is described in the documentation:
-=======
-The script builds the library from `libMacOBloxShims.m` in `build/`, launches
 the client from the project folder within an existing Darling prefix, and writes
 the output to a separate file in `logs/launch-*.log`. Arguments are passed to the client.
 The launch itself requires a running Darling outside the restricted Codex environment.
@@ -331,18 +218,6 @@ has not been verified, and a new build does not add this folder to the library p
 
 Accessing host files via `/Volumes/SystemRoot` is described in the documentation: 
 https://docs.darlinghq.org/internals/basics/containerization.html
-
-## Blocker on the host after lifting Codex restrictions
-
-2026-09-21: The kernel was updated at 16:12 to 7.2.6-1-cachyos, but 7.2.0-1-cachyos is running. The module directory for the running kernel is missing; OverlayFS
-is not registered in /proc/filesystems, and `modinfo overlay` fails.
-This explains the `Cannot mount overlay: No such device` error before Roblox starts.
-The update log confirms that the new kernel’s initramfs was successfully generated.
-The next step is a normal reboot into the installed kernel, followed by running
-`run_debug.sh`. An automatic reboot did not occur.
-The script now detects this situation before Darling starts.
-
-## Post-reboot check, 2026-09-21 16:21–16:29
 
 ## Blocker on the host after lifting Codex restrictions
 
