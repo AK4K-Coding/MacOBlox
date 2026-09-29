@@ -97,6 +97,8 @@ DEFAULT_SETTINGS = {
     "show_playtime": True,
     "playtime_seconds": 0,
     "discord_rpc": True,
+    "discord_rpc_game": True,
+    "discord_rpc_icon": False,
     "auto_check_roblox_updates": True,
     "mod_death_sound": "default",
     "mod_custom_death_sound": "",

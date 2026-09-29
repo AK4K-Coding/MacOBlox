@@ -655,6 +655,26 @@ class SettingsPage(Adw.Bin):
         discord_rpc.connect("notify::active", lambda row, _pspec: window.set_discord_rpc(row.get_active()))
         game.add(discord_rpc)
 
+        self.discord_game = Adw.SwitchRow(
+            title=_("Show experience name in Discord"),
+            subtitle=_("Display the title and creator of the place you are playing"),
+            active=settings.get("discord_rpc_game", True),
+        )
+        self.discord_game.set_sensitive(settings.get("discord_rpc", True))
+        self.discord_game.connect("notify::active", lambda row, _pspec: window.set_discord_rpc_option(
+            "discord_rpc_game", row.get_active()))
+        game.add(self.discord_game)
+
+        self.discord_icon = Adw.SwitchRow(
+            title=_("Show experience thumbnail in Discord"),
+            subtitle=_("Replace the Mac O’ Blox icon with the game's icon"),
+            active=settings.get("discord_rpc_icon", False),
+        )
+        self.discord_icon.set_sensitive(settings.get("discord_rpc", True))
+        self.discord_icon.connect("notify::active", lambda row, _pspec: window.set_discord_rpc_option(
+            "discord_rpc_icon", row.get_active()))
+        game.add(self.discord_icon)
+
         playtime_switch = Adw.SwitchRow(title=_("Show playtime"),
                                         subtitle=_("Show accumulated playtime on the Play page"),
                                         active=settings.get("show_playtime", True))
@@ -1392,6 +1412,9 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.settings = core.load_settings()
         i18n.set_language(self.settings.get("language", "en"))
         self.session = None
+        self.rpc = None
+        self.game_tracker = None
+        self.current_game_info = None
         # One long operation at a time: starting, updating, building,
         # restarting Darling or signing out. They share the client and Darling.
         self.busy = None
@@ -1661,27 +1684,74 @@ class LauncherWindow(Adw.ApplicationWindow):
 
     def set_discord_rpc(self, enabled):
         self.set_setting("discord_rpc", enabled)
+        if hasattr(self, "settings_page"):
+            if hasattr(self.settings_page, "discord_game"):
+                self.settings_page.discord_game.set_sensitive(enabled)
+            if hasattr(self.settings_page, "discord_icon"):
+                self.settings_page.discord_icon.set_sensitive(enabled)
         if not enabled:
             self._stop_rpc()
         elif self.session:
             self._start_rpc()
 
+    def set_discord_rpc_option(self, key, value):
+        self.set_setting(key, value)
+        if self.session and self.settings.get("discord_rpc", True):
+            self._refresh_rpc_presence()
+
     def set_show_playtime(self, enabled):
         self.set_setting("show_playtime", enabled)
         self.play_page.refresh_playtime()
 
-    def _start_rpc(self):
+    def _on_game_activity_change(self, info: dict | None):
+        self.current_game_info = info
+        GLib.idle_add(self._refresh_rpc_presence)
+
+    def _refresh_rpc_presence(self):
+        if not self.settings.get("discord_rpc", True):
+            return
         if getattr(self, "rpc", None) is None:
             self.rpc = discord.DiscordRPC()
         rpc = self.rpc
         start = getattr(self, "game_started_at", time.time())
+        info = getattr(self, "current_game_info", None)
+
+        if info and self.settings.get("discord_rpc_game", True):
+            details = info.get("name", _("Playing Roblox"))
+            creator = info.get("creator")
+            state = _("by {creator}", creator=creator) if creator else _("In Game")
+            icon_url = info.get("icon_url")
+            use_icon = self.settings.get("discord_rpc_icon", False) and bool(icon_url)
+            large_image = icon_url if use_icon else "macoblox"
+            large_text = details
+            small_image = "macoblox" if use_icon else None
+            small_text = "Mac O’ Blox" if use_icon else None
+        else:
+            details = _("Playing Roblox")
+            state = _("In Game")
+            large_image = "macoblox"
+            large_text = "Mac O’ Blox"
+            small_image = None
+            small_text = None
+
         threading.Thread(target=lambda: rpc.update_presence(
-            details=_("Playing Roblox"),
-            state=_("In Game"),
+            details=details,
+            state=state,
             start_time=start,
+            large_image=large_image,
+            large_text=large_text,
+            small_image=small_image,
+            small_text=small_text,
         ), daemon=True).start()
 
+    def _start_rpc(self):
+        self._refresh_rpc_presence()
+
     def _stop_rpc(self):
+        if getattr(self, "game_tracker", None):
+            self.game_tracker.stop()
+            self.game_tracker = None
+        self.current_game_info = None
         if getattr(self, "rpc", None):
             rpc = self.rpc
             self.rpc = None
@@ -1700,9 +1770,15 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.last_log = session.log_path
         self.game_started_at = time.time()
         self.last_playtime_save = time.time()
+        self.current_game_info = None
         self.play_page.refresh()
         if self.settings.get("discord_rpc", True):
             self._start_rpc()
+        if self.session and self.session.log_path:
+            self.game_tracker = discord.GameActivityTracker(
+                self.session.log_path,
+                self._on_game_activity_change
+            )
         # Hide once the game window has had time to appear.
         GLib.timeout_add_seconds(3, self._hide_while_playing)
         GLib.timeout_add(1000, self._watch)

@@ -5,14 +5,139 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import socket
 import struct
+import threading
 import time
+import urllib.request
 import uuid
+from pathlib import Path
 
 log = logging.getLogger("macoblox.discord")
 
 CLIENT_ID = "1468188794309050523"
+
+_GAME_CACHE: dict[int, dict] = {}
+
+
+def fetch_game_info(place_id: int, universe_id: int | None = None) -> dict | None:
+    """Fetch experience title, creator, and icon from public Roblox APIs."""
+    if place_id in _GAME_CACHE:
+        return _GAME_CACHE[place_id]
+
+    try:
+        if not universe_id:
+            req = urllib.request.Request(
+                f"https://apis.roblox.com/universes/v1/places/{place_id}/universe",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                data = json.loads(resp.read().decode())
+                universe_id = data.get("universeId")
+
+        if not universe_id:
+            return None
+
+        req = urllib.request.Request(
+            f"https://games.roblox.com/v1/games?universeIds={universe_id}",
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            data = json.loads(resp.read().decode())
+            entries = data.get("data", [])
+            if not entries:
+                return None
+            entry = entries[0]
+            name = entry.get("name", "Roblox")
+            creator = entry.get("creator", {}).get("name", "")
+
+        icon_url = None
+        try:
+            req_icon = urllib.request.Request(
+                f"https://thumbnails.roblox.com/v1/games/icons?universeIds={universe_id}&returnPolicy=PlaceHolder&size=512x512&format=Png&isCircular=false",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req_icon, timeout=4) as resp:
+                idata = json.loads(resp.read().decode())
+                ientries = idata.get("data", [])
+                if ientries and ientries[0].get("imageUrl"):
+                    icon_url = ientries[0]["imageUrl"]
+        except Exception:
+            pass
+
+        info = {
+            "place_id": place_id,
+            "universe_id": universe_id,
+            "name": name,
+            "creator": creator,
+            "icon_url": icon_url,
+        }
+        _GAME_CACHE[place_id] = info
+        return info
+    except Exception as e:
+        log.debug("Failed to fetch game info for place %s: %s", place_id, e)
+        return None
+
+
+class GameActivityTracker:
+    """Watches the active Roblox launch log to detect experience joins/leaves."""
+
+    def __init__(self, log_path: Path, on_change):
+        self.log_path = log_path
+        self.on_change = on_change
+        self.running = True
+        self.current_place_id: int | None = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+
+    def _run(self):
+        join_re = re.compile(r"!\s*Joining game\s+'[^']*'\s+place\s+(\d+)", re.IGNORECASE)
+        uid_re = re.compile(r'"universeId":\s*(\d+)', re.IGNORECASE)
+        leave_re = re.compile(
+            r"leaveUGCGame|destroyCaptureModeDataModelIfExists|Destroying MegaReplicator",
+            re.IGNORECASE
+        )
+
+        last_pos = 0
+        universe_id = None
+        while self.running:
+            if not self.log_path.exists():
+                time.sleep(0.5)
+                continue
+            try:
+                with open(self.log_path, "r", encoding="utf-8", errors="ignore") as f:
+                    f.seek(last_pos)
+                    for line in f:
+                        if not self.running:
+                            break
+                        um = uid_re.search(line)
+                        if um:
+                            universe_id = int(um.group(1))
+
+                        jm = join_re.search(line)
+                        if jm:
+                            place_id = int(jm.group(1))
+                            if place_id != self.current_place_id:
+                                self.current_place_id = place_id
+                                info = fetch_game_info(place_id, universe_id)
+                                if self.running:
+                                    self.on_change(info)
+                            continue
+
+                        if self.current_place_id is not None and leave_re.search(line):
+                            self.current_place_id = None
+                            universe_id = None
+                            if self.running:
+                                self.on_change(None)
+
+                    last_pos = f.tell()
+            except Exception as e:
+                log.debug("Log tracker error: %s", e)
+            time.sleep(0.5)
 
 
 class DiscordRPC:
@@ -89,18 +214,26 @@ class DiscordRPC:
         start_time: float | None = None,
         large_image: str = "macoblox",
         large_text: str = "Mac O’ Blox",
+        small_image: str | None = None,
+        small_text: str | None = None,
     ) -> bool:
         if not self._connected:
             if not self.connect():
                 return False
+        assets: dict = {
+            "large_image": large_image,
+            "large_text": large_text,
+        }
+        if small_image:
+            assets["small_image"] = small_image
+            if small_text:
+                assets["small_text"] = small_text
         activity: dict = {
             "details": details,
-            "state": state,
-            "assets": {
-                "large_image": large_image,
-                "large_text": large_text,
-            },
+            "assets": assets,
         }
+        if state:
+            activity["state"] = state
         if start_time:
             activity["timestamps"] = {"start": int(start_time)}
         message = {
