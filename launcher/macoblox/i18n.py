@@ -139,6 +139,7 @@ RU = {
         "Камера следует за движением самой мыши, без ускорения указателя (XInput 2)",
     "Hide the launcher window while the game is running": "Скрывать окно лаунчера, пока запущена игра",
     "Discord Rich Presence": "Discord Rich Presence",
+    "Enable Discord Rich Presence": "Включить Discord Rich Presence",
     "Show current game and playtime in your Discord status": "Показывать статус игры и время в Discord",
     "Show experience name in Discord": "Показывать название игры в Discord",
     "Display the title and creator of the place you are playing":
@@ -146,6 +147,9 @@ RU = {
     "Show experience thumbnail in Discord": "Показывать иконку плейса в Discord",
     "Replace the Mac O’ Blox icon with the game's icon":
         "Заменять иконку Mac O’ Blox на обложку игры",
+    "Show elapsed time in Discord": "Показывать прошедшее время в Discord",
+    "Display how long you have been playing in your status":
+        "Отображать время, прошедшее с момента запуска игры",
     "Show playtime": "Показывать время в игре",
     "Show accumulated playtime on the Play page": "Отображать наигранное время на вкладке «Играть»",
     "Total playtime": "Всего наиграно",

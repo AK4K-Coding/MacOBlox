@@ -18,7 +18,36 @@ log = logging.getLogger("macoblox.discord")
 
 CLIENT_ID = "1468188794309050523"
 
+CACHE_FILE = (
+    Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    / "MacOBlox"
+    / "game_cache.json"
+)
+
 _GAME_CACHE: dict[int, dict] = {}
+
+
+def _load_cache():
+    global _GAME_CACHE
+    try:
+        if CACHE_FILE.exists():
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+                _GAME_CACHE = {int(k): v for k, v in raw.items()}
+    except Exception as e:
+        log.debug("Failed to load game cache: %s", e)
+
+
+def _save_cache():
+    try:
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in _GAME_CACHE.items()}, f)
+    except Exception as e:
+        log.debug("Failed to save game cache: %s", e)
+
+
+_load_cache()
 
 
 def fetch_game_info(place_id: int, universe_id: int | None = None) -> dict | None:
@@ -32,8 +61,8 @@ def fetch_game_info(place_id: int, universe_id: int | None = None) -> dict | Non
                 f"https://apis.roblox.com/universes/v1/places/{place_id}/universe",
                 headers={"User-Agent": "Mozilla/5.0"}
             )
-            with urllib.request.urlopen(req, timeout=4) as resp:
-                data = json.loads(resp.read().decode())
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
                 universe_id = data.get("universeId")
 
         if not universe_id:
@@ -43,8 +72,8 @@ def fetch_game_info(place_id: int, universe_id: int | None = None) -> dict | Non
             f"https://games.roblox.com/v1/games?universeIds={universe_id}",
             headers={"User-Agent": "Mozilla/5.0"}
         )
-        with urllib.request.urlopen(req, timeout=4) as resp:
-            data = json.loads(resp.read().decode())
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
             entries = data.get("data", [])
             if not entries:
                 return None
@@ -58,8 +87,8 @@ def fetch_game_info(place_id: int, universe_id: int | None = None) -> dict | Non
                 f"https://thumbnails.roblox.com/v1/games/icons?universeIds={universe_id}&returnPolicy=PlaceHolder&size=512x512&format=Png&isCircular=false",
                 headers={"User-Agent": "Mozilla/5.0"}
             )
-            with urllib.request.urlopen(req_icon, timeout=4) as resp:
-                idata = json.loads(resp.read().decode())
+            with urllib.request.urlopen(req_icon, timeout=5) as resp:
+                idata = json.loads(resp.read().decode("utf-8"))
                 ientries = idata.get("data", [])
                 if ientries and ientries[0].get("imageUrl"):
                     icon_url = ientries[0]["imageUrl"]
@@ -74,6 +103,7 @@ def fetch_game_info(place_id: int, universe_id: int | None = None) -> dict | Non
             "icon_url": icon_url,
         }
         _GAME_CACHE[place_id] = info
+        _save_cache()
         return info
     except Exception as e:
         log.debug("Failed to fetch game info for place %s: %s", place_id, e)
@@ -88,53 +118,99 @@ class GameActivityTracker:
         self.on_change = on_change
         self.running = True
         self.current_place_id: int | None = None
+        self.current_universe_id: int | None = None
+        self._resolve_thread: threading.Thread | None = None
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def stop(self):
         self.running = False
 
+    def _resolve_in_background(self, place_id: int, universe_id: int | None):
+        def _worker():
+            for attempt in range(6):
+                if not self.running or self.current_place_id != place_id:
+                    return
+                info = fetch_game_info(place_id, universe_id)
+                if info:
+                    if self.running and self.current_place_id == place_id:
+                        self.on_change(info)
+                    return
+                time.sleep(1.0 + attempt * 0.5)
+
+        self._resolve_thread = threading.Thread(target=_worker, daemon=True)
+        self._resolve_thread.start()
+
     def _run(self):
-        join_re = re.compile(r"!\s*Joining game\s+'[^']*'\s+place\s+(\d+)", re.IGNORECASE)
-        uid_re = re.compile(r'"universeId":\s*(\d+)', re.IGNORECASE)
+        join_re = re.compile(
+            r"!\s*Joining game\s+['\"][^'\"]*['\"]\s+place\s+(\d+)|"
+            r"GameJoinUtil::joinGamePost.*BODY:.*[\"']placeId[\"']:\s*(\d+)|"
+            r"status code:.*[\"']PlaceId[\"']:\s*(\d+)|"
+            r"Report game_join_loadtime:.*placeid:(\d+)",
+            re.IGNORECASE
+        )
+        uid_re = re.compile(
+            r"[\"']UniverseId[\"']:\s*(\d+)|"
+            r"universeid:(\d+)",
+            re.IGNORECASE
+        )
         leave_re = re.compile(
-            r"leaveUGCGame|destroyCaptureModeDataModelIfExists|Destroying MegaReplicator",
+            r"leaveUGCGame|returnToLuaApp|stage:LuaApp|destroyCaptureModeDataModelIfExists|Destroying MegaReplicator",
             re.IGNORECASE
         )
 
         last_pos = 0
         universe_id = None
+
         while self.running:
             if not self.log_path.exists():
                 time.sleep(0.5)
                 continue
             try:
-                with open(self.log_path, "r", encoding="utf-8", errors="ignore") as f:
+                with open(self.log_path, "rb") as f:
                     f.seek(last_pos)
-                    for line in f:
-                        if not self.running:
-                            break
-                        um = uid_re.search(line)
-                        if um:
-                            universe_id = int(um.group(1))
+                    chunk = f.read()
+                    if chunk:
+                        idx = chunk.rfind(b"\n")
+                        if idx != -1:
+                            raw_lines = chunk[:idx + 1]
+                            last_pos += idx + 1
+                            lines = raw_lines.decode("utf-8", errors="replace").splitlines()
+                            for line in lines:
+                                if not self.running:
+                                    break
 
-                        jm = join_re.search(line)
-                        if jm:
-                            place_id = int(jm.group(1))
-                            if place_id != self.current_place_id:
-                                self.current_place_id = place_id
-                                info = fetch_game_info(place_id, universe_id)
-                                if self.running:
-                                    self.on_change(info)
-                            continue
+                                um = uid_re.search(line)
+                                if um:
+                                    for g in um.groups():
+                                        if g:
+                                            universe_id = int(g)
+                                            break
 
-                        if self.current_place_id is not None and leave_re.search(line):
-                            self.current_place_id = None
-                            universe_id = None
-                            if self.running:
-                                self.on_change(None)
+                                jm = join_re.search(line)
+                                if jm:
+                                    place_id = None
+                                    for g in jm.groups():
+                                        if g:
+                                            place_id = int(g)
+                                            break
+                                    if place_id and place_id != self.current_place_id:
+                                        self.current_place_id = place_id
+                                        self.current_universe_id = universe_id
+                                        cached = _GAME_CACHE.get(place_id)
+                                        if cached:
+                                            self.on_change(cached)
+                                        else:
+                                            self.on_change({"place_id": place_id, "name": "Roblox", "loading": True})
+                                            self._resolve_in_background(place_id, universe_id)
+                                    continue
 
-                    last_pos = f.tell()
+                                if self.current_place_id is not None and leave_re.search(line):
+                                    self.current_place_id = None
+                                    self.current_universe_id = None
+                                    universe_id = None
+                                    if self.running:
+                                        self.on_change(None)
             except Exception as e:
                 log.debug("Log tracker error: %s", e)
             time.sleep(0.5)
@@ -210,7 +286,7 @@ class DiscordRPC:
     def update_presence(
         self,
         details: str = "Playing Roblox",
-        state: str = "In Game",
+        state: str | None = None,
         start_time: float | None = None,
         large_image: str = "macoblox",
         large_text: str = "Mac O’ Blox",

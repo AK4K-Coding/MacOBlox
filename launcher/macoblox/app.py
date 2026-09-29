@@ -649,11 +649,24 @@ class SettingsPage(Adw.Bin):
             "show_launcher_after_exit", row.get_active()))
         game.add(reopen)
 
-        discord_rpc = Adw.SwitchRow(title=_("Discord Rich Presence"),
-                                    subtitle=_("Show current game and playtime in your Discord status"),
-                                    active=settings.get("discord_rpc", True))
-        discord_rpc.connect("notify::active", lambda row, _pspec: window.set_discord_rpc(row.get_active()))
-        game.add(discord_rpc)
+        playtime_switch = Adw.SwitchRow(title=_("Show playtime"),
+                                        subtitle=_("Show accumulated playtime on the Play page"),
+                                        active=settings.get("show_playtime", True))
+        playtime_switch.connect("notify::active", lambda row, _pspec: window.set_show_playtime(row.get_active()))
+        game.add(playtime_switch)
+
+        self.env_page.add(game)
+
+        # 3. Discord Rich Presence
+        discord_group = Adw.PreferencesGroup(title=_("Discord Rich Presence"))
+
+        self.discord_rpc_switch = Adw.SwitchRow(
+            title=_("Enable Discord Rich Presence"),
+            subtitle=_("Show current game and playtime in your Discord status"),
+            active=settings.get("discord_rpc", True),
+        )
+        self.discord_rpc_switch.connect("notify::active", lambda row, _pspec: window.set_discord_rpc(row.get_active()))
+        discord_group.add(self.discord_rpc_switch)
 
         self.discord_game = Adw.SwitchRow(
             title=_("Show experience name in Discord"),
@@ -663,7 +676,7 @@ class SettingsPage(Adw.Bin):
         self.discord_game.set_sensitive(settings.get("discord_rpc", True))
         self.discord_game.connect("notify::active", lambda row, _pspec: window.set_discord_rpc_option(
             "discord_rpc_game", row.get_active()))
-        game.add(self.discord_game)
+        discord_group.add(self.discord_game)
 
         self.discord_icon = Adw.SwitchRow(
             title=_("Show experience thumbnail in Discord"),
@@ -673,15 +686,19 @@ class SettingsPage(Adw.Bin):
         self.discord_icon.set_sensitive(settings.get("discord_rpc", True))
         self.discord_icon.connect("notify::active", lambda row, _pspec: window.set_discord_rpc_option(
             "discord_rpc_icon", row.get_active()))
-        game.add(self.discord_icon)
+        discord_group.add(self.discord_icon)
 
-        playtime_switch = Adw.SwitchRow(title=_("Show playtime"),
-                                        subtitle=_("Show accumulated playtime on the Play page"),
-                                        active=settings.get("show_playtime", True))
-        playtime_switch.connect("notify::active", lambda row, _pspec: window.set_show_playtime(row.get_active()))
-        game.add(playtime_switch)
+        self.discord_time = Adw.SwitchRow(
+            title=_("Show elapsed time in Discord"),
+            subtitle=_("Display how long you have been playing in your status"),
+            active=settings.get("discord_rpc_time", True),
+        )
+        self.discord_time.set_sensitive(settings.get("discord_rpc", True))
+        self.discord_time.connect("notify::active", lambda row, _pspec: window.set_discord_rpc_option(
+            "discord_rpc_time", row.get_active()))
+        discord_group.add(self.discord_time)
 
-        self.env_page.add(game)
+        self.env_page.add(discord_group)
 
         dns_group = Adw.PreferencesGroup(
             title=_("DNS for Roblox"),
@@ -1435,7 +1452,7 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.settings_page = SettingsPage(self)
         self.stack.add_titled_with_icon(self.settings_page, "settings", _("Settings"), "emblem-system-symbolic")
         self.mods_page = ModsPage(self)
-        self.stack.add_titled_with_icon(self.mods_page, "mods", _("Mods"), "extension-symbolic")
+        self.stack.add_titled_with_icon(self.mods_page, "mods", _("Mods"), "application-x-addon-symbolic")
         self.info_page = InfoPage(self)
         self.stack.add_titled_with_icon(self.info_page, "info", _("Info"), "help-about-symbolic")
         self.flags_page = self.settings_page.flags_page
@@ -1689,6 +1706,8 @@ class LauncherWindow(Adw.ApplicationWindow):
                 self.settings_page.discord_game.set_sensitive(enabled)
             if hasattr(self.settings_page, "discord_icon"):
                 self.settings_page.discord_icon.set_sensitive(enabled)
+            if hasattr(self.settings_page, "discord_time"):
+                self.settings_page.discord_time.set_sensitive(enabled)
         if not enabled:
             self._stop_rpc()
         elif self.session:
@@ -1713,10 +1732,14 @@ class LauncherWindow(Adw.ApplicationWindow):
         if getattr(self, "rpc", None) is None:
             self.rpc = discord.DiscordRPC()
         rpc = self.rpc
-        start = getattr(self, "game_started_at", time.time())
+        start = (
+            getattr(self, "game_started_at", time.time())
+            if self.settings.get("discord_rpc_time", True)
+            else None
+        )
         info = getattr(self, "current_game_info", None)
 
-        if info and self.settings.get("discord_rpc_game", True):
+        if info and not info.get("loading") and self.settings.get("discord_rpc_game", True):
             details = info.get("name", _("Playing Roblox"))
             creator = info.get("creator")
             state = _("by {creator}", creator=creator) if creator else _("In Game")
@@ -1726,9 +1749,18 @@ class LauncherWindow(Adw.ApplicationWindow):
             large_text = details
             small_image = "macoblox" if use_icon else None
             small_text = "Mac O’ Blox" if use_icon else None
-        else:
+        elif info:
+            # Game is active (either fetching details or user hid experience name in settings)
             details = _("Playing Roblox")
             state = _("In Game")
+            large_image = "macoblox"
+            large_text = "Mac O’ Blox"
+            small_image = None
+            small_text = None
+        else:
+            # Menu (not in an experience)
+            details = _("In Main Menu")
+            state = None
             large_image = "macoblox"
             large_text = "Mac O’ Blox"
             small_image = None
